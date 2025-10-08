@@ -10,7 +10,6 @@
 *.opendb
 *.cs
 *.cache
-*.cpp
 *.tlog
 *.lastbuildstate
 *.dll
@@ -51,5 +50,6 @@
 /examples/cpp/sni_inspector/vcpkg_installed
 /examples/cpp/socksify/vcpkg_installed
 /examples/cpp/udp2tcp/vcpkg_installed
+/examples/cpp/stcp/vcpkg_installed
 *.res
 /packages
