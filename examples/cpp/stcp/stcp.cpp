@@ -1,5 +1,6 @@
 // stcp.cpp - 修复TCP选项对齐问题版本（12字节注入）
 #include "pch.h"
+#include "process_filter.h"
 #include <iostream>
 #include <fstream>
 #include <memory>
@@ -377,6 +378,96 @@ bool InjectDataAsTcpOption(ndisapi::fastio_packet_filter* ndis_api,
     return bSuccess;
 }
 
+class ipv6_parser
+{
+public:
+	// ********************************************************************************
+	/// <summary>
+	/// parses IP headers until the transport payload
+	/// </summary>
+	/// <param name="ip_header">pointer to IP header</param>
+	/// <param name="packet_size">size of IP packet in octets</param>
+	/// <returns>pointer to IP packet payload (TCP, UDP, ICMPv6 and etc..) and protocol</returns>
+	// ********************************************************************************
+	static std::pair<void*, unsigned char> find_transport_header(
+		ipv6hdr* ip_header,
+		const unsigned packet_size
+	)
+	{
+		unsigned char next_proto = 0;
+
+		//
+		// Parse IPv6 headers
+		//
+
+		// Check if this IPv6 packet
+		if (ip_header->ip6_v != 6)
+		{
+			return {nullptr, next_proto};
+		}
+
+		// Find the first header
+		next_proto = ip_header->ip6_next;
+		auto* next_header = reinterpret_cast<ipv6ext_ptr>(ip_header + 1);
+
+		// Loop until we find the last IP header
+		while (TRUE)
+		{
+			// Ensure that current header is still within the packet
+			if (reinterpret_cast<char*>(next_header) > reinterpret_cast<char*>(ip_header) + packet_size - sizeof(
+				ipv6ext))
+			{
+				return {nullptr, next_proto};
+			}
+
+			switch (next_proto)
+			{
+				// Fragmentation
+			case IPPROTO_FRAGMENT:
+				{
+					auto* const frag = reinterpret_cast<ipv6ext_frag_ptr>(next_header);
+
+					// If this isn't the FIRST fragment, there won't be a TCP/UDP header anyway
+					if ((frag->ip6_offlg & 0xFC) != 0)
+					{
+						// The offset is non-zero
+						next_proto = frag->ip6_next;
+
+						return {nullptr, next_proto};
+					}
+
+					// Otherwise it's either an entire segment or the first fragment
+					next_proto = frag->ip6_next;
+
+					// Return next octet following the fragmentation header
+					next_header = reinterpret_cast<ipv6ext_ptr>(reinterpret_cast<char*>(next_header) + sizeof(
+						ipv6ext_frag));
+
+					return {next_header, next_proto};
+				}
+
+				// Headers we just skip over
+			case IPPROTO_HOPOPTS:
+			case IPPROTO_ROUTING:
+			case IPPROTO_DSTOPTS:
+				next_proto = next_header->ip6_next;
+
+				// As per RFC 2460 : ip6ext_len specifies the extended
+				// header length, in units of 8 octets *not including* the
+				// first 8 octets.
+
+				next_header = reinterpret_cast<ipv6ext_ptr>(reinterpret_cast<char*>(next_header) + 8 + (next_header->
+					ip6_len) * 8);
+				break;
+
+			default:
+				// No more IPv6 headers to skip
+				return {next_header, next_proto};
+			}
+		}
+	}
+};
+
 int main() {
     try {
         logFile = std::ofstream("log.txt", std::ios::app);
@@ -414,13 +505,19 @@ int main() {
             },
             [&ndis_api](HANDLE, INTERMEDIATE_BUFFER& buffer) {
                 // 出站数据包处理
+				// 进程过滤检查
+
                 if (auto* const ether_header = reinterpret_cast<ether_header_ptr>(buffer.m_IBuffer); 
-                    ntohs(ether_header->h_proto) == ETH_P_IP) {
+                    ntohs(ether_header->h_proto) == ETH_P_IP) { // 处理IPv4
                     if (auto* const ip_header = reinterpret_cast<iphdr_ptr>(ether_header + 1); 
                         ip_header->ip_p == IPPROTO_TCP) {
+
                         auto* const tcp_header = reinterpret_cast<tcphdr_ptr>(
                             reinterpret_cast<PUCHAR>(ip_header) + sizeof(DWORD) * ip_header->ip_hl);
                         
+						std::wstring _process = ProcessFilter::queryProcessByBuffer2(ip_header, tcp_header);
+						logFile << "Process: " << std::string(_process.begin(), _process.end()) << std::endl;
+
                         u_char tcpFlags = tcp_header->th_flags;
                         logFile << "=== Outgoing TCP Flags: " << static_cast<int>(tcpFlags) << " ===" << std::endl;
 
@@ -443,6 +540,16 @@ int main() {
                         }
                     }
                 }
+				if (auto* const ethernet_header = reinterpret_cast<ether_header_ptr>(buffer.m_IBuffer); ntohs(
+					ethernet_header->h_proto) == ETH_P_IPV6)
+				{ // 处理IPv6
+
+					auto* const ip_header = reinterpret_cast<ipv6hdr_ptr>(ethernet_header + 1);
+
+					if (const auto [header, protocol] = ipv6_parser::find_transport_header(
+						ip_header, buffer.m_Length - ETHER_HEADER_LENGTH); header && protocol == IPPROTO_TCP)
+					{}
+				}
                 return ndisapi::fastio_packet_filter::packet_action::pass;
             }, 
             true);

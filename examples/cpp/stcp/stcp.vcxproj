@@ -275,6 +275,7 @@
     <ClInclude Include="..\common\pcap\pcap.h" />
     <ClInclude Include="..\common\pcap\pcap_file_storage.h" />
     <ClInclude Include="pch.h" />
+    <ClCompile Include="process_filter.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="stcp.cpp" />

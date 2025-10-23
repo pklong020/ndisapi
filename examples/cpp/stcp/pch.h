@@ -51,6 +51,8 @@
 #include "../common/net/mac_address.h"
 #include "../common/net/ip_address.h"
 #include "../common/net/ip_subnet.h"
+#include "../common/net/ip_endpoint.h"
+#include "../common/iphelper/process_lookup.h"
 #include "../common/iphelper/network_adapter_info.h"
 #include "../common/ndisapi/network_adapter.h"
 #include "../common/ndisapi/fastio_packet_filter.h"
