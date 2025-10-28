@@ -274,11 +274,16 @@
     <ClInclude Include="..\common\ndisapi\fastio_packet_filter.h" />
     <ClInclude Include="..\common\pcap\pcap.h" />
     <ClInclude Include="..\common\pcap\pcap_file_storage.h" />
-    <ClInclude Include="pch.h" />
+    <ClInclude Include="aes_128_helper.h" />
     <ClCompile Include="process_filter.h" />
+    <ClCompile Include="service_ctl.h" />
+    <ClInclude Include="pch.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="stcp.cpp" />
+    <ClCompile Include="aes_128_helper.cpp" />
+    <ClCompile Include="process_filter.cpp" />
+    <ClCompile Include="service_ctl.cpp" />
     <ClCompile Include="pch.cpp">
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">Create</PrecompiledHeader>
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|ARM64'">Create</PrecompiledHeader>

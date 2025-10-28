@@ -53,3 +53,5 @@
 /examples/cpp/stcp/vcpkg_installed
 *.res
 /packages
+/.vs
+/bin/examples

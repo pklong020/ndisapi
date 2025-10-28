@@ -1,6 +1,8 @@
-// stcp.cpp - 修复TCP选项对齐问题版本（12字节注入）
+// stcp.cpp - 修复TCP选项对齐问题版本（16字节注入）
 #include "pch.h"
 #include "process_filter.h"
+#include "aes_128_helper.h"
+#include "service_ctl.h"
 #include <iostream>
 #include <fstream>
 #include <memory>
@@ -27,8 +29,9 @@
 std::ofstream logFile;
 pcap::pcap_file_storage file_stream;
 
-// 修改为注入12个数字
-const BYTE INJECTION_DATA[] = { 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10 };  // 12字节数据
+
+// 注入16字节数据
+const BYTE INJECTION_DATA[] = { 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10 };
 const DWORD INJECTION_DATA_SIZE = sizeof(INJECTION_DATA);
 const UCHAR TCPOPT_CUSTOM = 253;  // 使用实验性选项类型
 const UCHAR TCPOPT_CUSTOM_LENGTH = 2 + INJECTION_DATA_SIZE;  // kind(1) + len(1) + data
@@ -468,7 +471,188 @@ public:
 	}
 };
 
-int main() {
+DWORD GetDefaultGatewayInterface() {
+	PMIB_IPFORWARDTABLE pIpForwardTable = nullptr;
+	DWORD dwSize = 0;
+	DWORD dwResult = 0;
+	DWORD defaultInterfaceIndex = 0;
+	
+	// 获取IP路由表
+	dwResult = GetIpForwardTable(pIpForwardTable, &dwSize, TRUE);
+	if (dwResult == ERROR_INSUFFICIENT_BUFFER) {
+		pIpForwardTable = (PMIB_IPFORWARDTABLE)malloc(dwSize);
+		if (!pIpForwardTable) return 0;
+		
+		dwResult = GetIpForwardTable(pIpForwardTable, &dwSize, TRUE);
+		if (dwResult == NO_ERROR) {
+			// 查找默认路由 (0.0.0.0)
+			for (DWORD i = 0; i < pIpForwardTable->dwNumEntries; i++) {
+				if (pIpForwardTable->table[i].dwForwardDest == 0) { // 0.0.0.0
+					defaultInterfaceIndex = pIpForwardTable->table[i].dwForwardIfIndex;
+					break;
+				}
+			}
+		}
+		free(pIpForwardTable);
+	}
+	
+	return defaultInterfaceIndex;
+}
+
+// 适配器信息结构
+struct AdapterInfo {
+	DWORD interfaceIndex;
+	std::string name;
+	std::string description;
+	std::string friendlyName;
+	std::string ipAddress;
+	std::string macAddress;
+	ULONGLONG totalTraffic;
+};
+
+std::string Transtype(PWCHAR chars){
+	std::string result;
+	for (size_t i = 0; i < sizeof(chars); ++i) {
+		result += static_cast<char>(chars[i] & 0xFF); // 只取低8位，假定是ASCII字符
+	}
+	return result;
+}
+
+// 获取所有适配器的详细信息
+std::vector<AdapterInfo> GetAllAdaptersInfo() {
+	std::vector<AdapterInfo> adapters;
+	
+	// 方法1: 使用GetAdaptersAddresses（推荐）
+	PIP_ADAPTER_ADDRESSES pAddresses = nullptr;
+	ULONG outBufLen = 0;
+	DWORD dwRetVal = 0;
+	
+	// 第一次调用获取缓冲区大小
+	dwRetVal = GetAdaptersAddresses(AF_UNSPEC, 0, NULL, pAddresses, &outBufLen);
+	if (dwRetVal == ERROR_BUFFER_OVERFLOW) {
+		pAddresses = (PIP_ADAPTER_ADDRESSES)malloc(outBufLen);
+		if (pAddresses) {
+			// 第二次调用获取实际数据
+			dwRetVal = GetAdaptersAddresses(AF_UNSPEC, 0, NULL, pAddresses, &outBufLen);
+			if (dwRetVal == ERROR_SUCCESS) {
+				PIP_ADAPTER_ADDRESSES pCurrAddresses = pAddresses;
+				while (pCurrAddresses) {
+					AdapterInfo info;
+					info.interfaceIndex = pCurrAddresses->IfIndex;
+					info.name = pCurrAddresses->AdapterName;
+					info.description = Transtype(pCurrAddresses->Description);
+					
+					// 转换友好名称
+					if (pCurrAddresses->FriendlyName) {
+						info.friendlyName = Transtype(pCurrAddresses->FriendlyName);
+					}
+					
+					// // 获取IP地址
+					// PIP_ADAPTER_UNICAST_ADDRESS pUnicast = pCurrAddresses->FirstUnicastAddress;
+					// if (pUnicast && pUnicast->Address.lpSockaddr) {
+					// 	char ipStr[INET6_ADDRSTRLEN];
+					// 	DWORD ipStrLen = INET6_ADDRSTRLEN;
+						
+					// 	if (pUnicast->Address.lpSockaddr->sa_family == AF_INET) {
+					// 		sockaddr_in* sa_in = (sockaddr_in*)pUnicast->Address.lpSockaddr;
+					// 		inet_ntop(AF_INET, &(sa_in->sin_addr), ipStr, ipStrLen);
+					// 	} else if (pUnicast->Address.lpSockaddr->sa_family == AF_INET6) {
+					// 		sockaddr_in6* sa_in6 = (sockaddr_in6*)pUnicast->Address.lpSockaddr;
+					// 		inet_ntop(AF_INET6, &(sa_in6->sin6_addr), ipStr, ipStrLen);
+					// 	}
+						
+					// 	info.ipAddress = ipStr;
+					// }
+					
+					// // 获取MAC地址
+					// if (pCurrAddresses->PhysicalAddressLength > 0) {
+					// 	char macStr[18];
+					// 	snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+					// 		pCurrAddresses->PhysicalAddress[0],
+					// 		pCurrAddresses->PhysicalAddress[1],
+					// 		pCurrAddresses->PhysicalAddress[2],
+					// 		pCurrAddresses->PhysicalAddress[3],
+					// 		pCurrAddresses->PhysicalAddress[4],
+					// 		pCurrAddresses->PhysicalAddress[5]);
+					// 	info.macAddress = macStr;
+					// }
+					
+					// // 获取流量统计
+					// info.totalTraffic = GetAdapterTraffic(info.interfaceIndex);
+					
+					adapters.push_back(info);
+					pCurrAddresses = pCurrAddresses->Next;
+				}
+			}
+			free(pAddresses);
+		}
+	}
+	
+	return adapters;
+}
+
+// 获取默认网关的适配器信息（包含名称）
+AdapterInfo GetDefaultGatewayAdapterInfo() {
+	AdapterInfo adapterInfo = {};
+	
+	// 1. 获取默认网关的接口索引
+	DWORD defaultIfIndex = GetDefaultGatewayInterface();
+	if (defaultIfIndex == 0) {
+		std::cerr << "No default gateway found" << std::endl;
+		return adapterInfo;
+	}
+	
+	// 2. 获取所有适配器信息
+	auto allAdapters = GetAllAdaptersInfo();
+	
+	// 3. 查找匹配的适配器
+	for (const auto& adapter : allAdapters) {
+		if (adapter.interfaceIndex == defaultIfIndex) {
+			adapterInfo = adapter;
+			break;
+		}
+	}
+	
+	return adapterInfo;
+}
+
+
+int main(int argc, char* argv[]) {
+	if(argc > 1) {
+		for (int i = 1; i < argc; ++i) {
+			std::string arg = argv[i];
+			if (arg == "service") {
+				if (i+1 < argc) {
+					char* serviceCmd = argv[i+1];
+					if (serviceCmd == std::string("install")) {
+						if(!ServiceHelper::InstallService()){
+							std::cerr << "Service installation failed." << std::endl;
+						} else {
+							std::cout << "Service installed successfully." << std::endl;
+						}
+						return 0;
+					} else if (serviceCmd == std::string("uninstall")) {
+						if(!ServiceHelper::UnInstallService()){
+							std::cerr << "Service uninstallation failed." << std::endl;
+						} else {
+							std::cout << "Service uninstalled successfully." << std::endl;
+						}
+						return 0;
+					}else{
+						std::cerr << "Unknown service command: " << serviceCmd << std::endl;
+						return 0;
+					}
+				}
+			} else if (arg == "start") {
+				return 0;
+			} else if (arg == "stop") {
+				return 0;
+			} else if (arg == "restart") {
+				return 0;
+			}
+		}
+	}
+	
     try {
         logFile = std::ofstream("log.txt", std::ios::app);
         file_stream = pcap::pcap_file_storage();
@@ -516,6 +700,13 @@ int main() {
                             reinterpret_cast<PUCHAR>(ip_header) + sizeof(DWORD) * ip_header->ip_hl);
                         
 						std::wstring _process = ProcessFilter::queryProcessByBuffer2(ip_header, tcp_header);
+						std::string proStr = std::string(_process.begin(), _process.end());
+						if(proStr!="msedge.exe" &&
+						   proStr!="chrome.exe" &&
+						   proStr!="firefox.exe" ){
+							logFile << "Process: " << proStr << "Blocked" << std::endl;
+							return ndisapi::fastio_packet_filter::packet_action::drop;
+						}
 						logFile << "Process: " << std::string(_process.begin(), _process.end()) << std::endl;
 
                         u_char tcpFlags = tcp_header->th_flags;
@@ -561,19 +752,55 @@ int main() {
             return 1;
         }
 
-        std::cout << "Available network interfaces:" << std::endl << std::endl;
+//加解密开始==============================================
+		AESCrypto crypto;
+    
+		// 16字节密钥
+		std::vector<uint8_t> key = {0x01,0x23,0x45,0x67,0x89,0xAB,0xCD,0xEF,
+								0xFE,0xDC,0xBA,0x98,0x76,0x54,0x32,0x10};
+		
+		// 16字节原始数据
+		std::vector<uint8_t> original = {0x11,0x22,0x33,0x44,0x55,0x66,0x77,0x88,
+										0x99,0xAA,0xBB,0xCC,0xDD,0xEE,0xFF,0x00};
+		
+		if (crypto.initialize(key)) {
+			// 加密：16字节 → 16字节
+			std::vector<uint8_t> encrypted = crypto.encrypt(original);
+			
+			std::cout << "原始数据: ";
+			for (auto b : original) printf("%02X ", b);
+			std::cout << std::endl;
+			
+			std::cout << "加密后: ";
+			for (auto b : encrypted) printf("%02X ", b);
+			std::cout << std::endl;
+			
+			// 这里可以将encrypted注入到TCP选项中
+			
+			// 解密：16字节 → 16字节
+			std::vector<uint8_t> decrypted = crypto.decrypt(encrypted);
+			
+			std::cout << "解密后: ";
+			for (auto b : decrypted) printf("%02X ", b);
+			std::cout << std::endl;
+			
+			// 验证
+			if (original == decrypted) {
+				std::cout << "✓ 加解密成功！16字节 ↔ 16字节" << std::endl;
+			}
+		}
+
+//加解密结束============================================
+
         size_t index = 0;
-        for (auto& e : ndis_api->get_interface_names_list()) {
-            std::cout << ++index << ")\t" << e << std::endl;
-        }
-
-        std::cout << std::endl << "Select interface to filter:";
-        std::cin >> index;
-
-        if (index > ndis_api->get_interface_names_list().size()) {
-            std::cout << "Wrong parameter was selected. Out of range." << std::endl;
-            return 0;
-        }
+		AdapterInfo defaultAdapterInfo = GetDefaultGatewayAdapterInfo();
+		std::cout << "default interface: " << defaultAdapterInfo.friendlyName << std::endl;
+		for (auto& e : ndis_api->get_interface_names_list()) {
+			std::cout << ++index << ")\t" << e << std::endl;
+			if (defaultAdapterInfo.friendlyName.find(e) != std::string::npos) {
+				break;
+			}
+		}
 
         ndis_api->start_filter(index - 1);
 

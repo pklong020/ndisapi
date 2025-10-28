@@ -30,6 +30,9 @@
     <ClCompile Include="process_filter.h">
       <Filter>Header Files</Filter>
     </ClCompile>
+    <ClCompile Include="service_ctl.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
     <ClInclude Include="..\common\ndisapi\fastio_packet_filter.h">
       <Filter>Header Files\common\ndisapi</Filter>
     </ClInclude>
@@ -39,12 +42,18 @@
     <ClInclude Include="..\common\pcap\pcap_file_storage.h">
       <Filter>Header Files\common\pcap</Filter>
     </ClInclude>
+    <ClInclude Include="aes_128_helper.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="pch.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="stcp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="aes_128_helper.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>
