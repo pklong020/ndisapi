@@ -31,7 +31,7 @@ pcap::pcap_file_storage file_stream;
 
 
 // 注入16字节数据
-const BYTE INJECTION_DATA[] = { 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10 };
+const BYTE INJECTION_DATA[] = {0x65, 0x32, 0x68, 0x6B, 0x31, 0x68, 0x35, 0x67, 0x66, 0x7A, 0x30, 0x39, 0x33, 0x33, 0x34, 0x35};
 const DWORD INJECTION_DATA_SIZE = sizeof(INJECTION_DATA);
 const UCHAR TCPOPT_CUSTOM = 253;  // 使用实验性选项类型
 const UCHAR TCPOPT_CUSTOM_LENGTH = 2 + INJECTION_DATA_SIZE;  // kind(1) + len(1) + data
@@ -616,11 +616,25 @@ AdapterInfo GetDefaultGatewayAdapterInfo() {
 	return adapterInfo;
 }
 
+// 服务表
+SERVICE_TABLE_ENTRY ServiceTable[] = {
+    { (LPWSTR)SERVICE_NAME, (LPSERVICE_MAIN_FUNCTION)ServiceHelper::ServiceMain },
+    { NULL, NULL }
+};
 
 int main(int argc, char* argv[]) {
+	
+    logFile = std::ofstream("log.txt", std::ios::app);
+	if (!logFile.is_open()) {
+		std::cerr << "Failed to open log file." << std::endl;
+		return 0;
+	}
+	logFile << "Main run now" << std::endl;
+
 	if(argc > 1) {
 		for (int i = 1; i < argc; ++i) {
 			std::string arg = argv[i];
+			logFile << "Main arg: " << arg << std::endl;
 			if (arg == "service") {
 				if (i+1 < argc) {
 					char* serviceCmd = argv[i+1];
@@ -652,16 +666,21 @@ int main(int argc, char* argv[]) {
 			}
 		}
 	}
-	
-    try {
-        logFile = std::ofstream("log.txt", std::ios::app);
+
+	//if(!ServiceHelper::IsServiceRunning()){
+	if(!logFile.is_open()){ //开发阶段屏蔽服务模式
+		if (!StartServiceCtrlDispatcher(ServiceTable)) {
+			DWORD error = GetLastError();
+			std::cout << "StartServiceCtrlDispatcher failed, error: " << error << std::endl;
+		}
+	}else{
+
+
+//==============================主程序 - 开始======================================
+try {
         file_stream = pcap::pcap_file_storage();
         file_stream.open("syn.pcap");
         
-        if (!logFile.is_open()) {
-            std::cerr << "Failed to open log file." << std::endl;
-            return 0;
-        }
 
         std::unique_ptr<ndisapi::fastio_packet_filter> ndis_api;
         
@@ -759,9 +778,11 @@ int main(int argc, char* argv[]) {
 		std::vector<uint8_t> key = {0x01,0x23,0x45,0x67,0x89,0xAB,0xCD,0xEF,
 								0xFE,0xDC,0xBA,0x98,0x76,0x54,0x32,0x10};
 		
+		std::string dataStr = "e2hk1h5gfz093345";
+		std::vector<uint8_t> original = std::vector<uint8_t>(dataStr.begin(), dataStr.end());
 		// 16字节原始数据
-		std::vector<uint8_t> original = {0x11,0x22,0x33,0x44,0x55,0x66,0x77,0x88,
-										0x99,0xAA,0xBB,0xCC,0xDD,0xEE,0xFF,0x00};
+		// std::vector<uint8_t> original = {0x11,0x22,0x33,0x44,0x55,0x66,0x77,0x88,
+		// 								0x99,0xAA,0xBB,0xCC,0xDD,0xEE,0xFF,0x00};
 		
 		if (crypto.initialize(key)) {
 			// 加密：16字节 → 16字节
@@ -814,6 +835,12 @@ int main(int argc, char* argv[]) {
         logFile << "Exception occurred: " << ex.what() << std::endl;
         std::cout << "Exception occurred: " << ex.what() << std::endl;
     }
+//==============================主程序 - 结束======================================
+
+        return 1;
+    }
+	
+    
 
     return 0;
 }
