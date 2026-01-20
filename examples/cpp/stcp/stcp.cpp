@@ -3,6 +3,7 @@
 #include "process_filter.h"
 #include "aes_128_helper.h"
 #include "service_ctl.h"
+#include "get_sha256.h"
 #include <iostream>
 #include <fstream>
 #include <memory>
@@ -135,17 +136,17 @@ void AnalyzeTcpOptionsDetailed(tcphdr_ptr tcpHeader, DWORD* pUsedSpace, DWORD* p
     DWORD basicTcpHeaderSize = 20;
     DWORD currentOptionSpace = tcpHeaderLength - basicTcpHeaderSize;
     
-    logFile << "=== Detailed TCP Option Analysis ===" << std::endl;
-    logFile << "TCP header total length: " << tcpHeaderLength << std::endl;
-    logFile << "Basic TCP header size: " << basicTcpHeaderSize << std::endl;
-    logFile << "Current option space: " << currentOptionSpace << std::endl;
+    // logFile << "=== Detailed TCP Option Analysis ===" << std::endl;
+    // logFile << "TCP header total length: " << tcpHeaderLength << std::endl;
+    // logFile << "Basic TCP header size: " << basicTcpHeaderSize << std::endl;
+    // logFile << "Current option space: " << currentOptionSpace << std::endl;
     
     if (currentOptionSpace <= 0) {
         *pUsedSpace = 0;
         *pAvailableSpace = 40; // 最大选项空间
         *pPaddingNeeded = CalculateTcpOptionPadding(TCPOPT_CUSTOM_LENGTH);
-        logFile << "No existing options, full 40 bytes available" << std::endl;
-        logFile << "Padding needed for " << TCPOPT_CUSTOM_LENGTH << " bytes: " << *pPaddingNeeded << " bytes" << std::endl;
+        logFile << "[error] No existing options, full 40 bytes available" << std::endl;
+        logFile << "[error] Padding needed for " << TCPOPT_CUSTOM_LENGTH << " bytes: " << *pPaddingNeeded << " bytes" << std::endl;
         return;
     }
     
@@ -157,44 +158,44 @@ void AnalyzeTcpOptionsDetailed(tcphdr_ptr tcpHeader, DWORD* pUsedSpace, DWORD* p
     for (DWORD i = 0; i < currentOptionSpace; ) {
         UCHAR kind = currentOptions[i];
         
-        logFile << "Option at position " << i << ": kind=" << (int)kind;
+        //logFile << "Option at position " << i << ": kind=" << (int)kind;
         
         if (kind == TCPOPT_EOL) {
-            logFile << " (EOL)" << std::endl;
+            //logFile << " (EOL)" << std::endl;
             foundEOL = true;
             usedSpace = i + 1;
             break;
         }
         else if (kind == TCPOPT_NOP) {
-            logFile << " (NOP)" << std::endl;
+            //logFile << " (NOP)" << std::endl;
             i++;
             usedSpace = i;
             continue;
         }
         else if (i + 1 >= currentOptionSpace) {
-            logFile << " - incomplete option" << std::endl;
+            //logFile << " - incomplete option" << std::endl;
             break;
         }
         
         UCHAR optLen = currentOptions[i + 1];
-        logFile << ", length=" << (int)optLen;
+        //logFile << ", length=" << (int)optLen;
         
         if (optLen == 0 || optLen == 1) {
-            logFile << " - invalid length" << std::endl;
+            //logFile << " - invalid length" << std::endl;
             break;
         }
         
         if (i + optLen > currentOptionSpace) {
-            logFile << " - length exceeds option space" << std::endl;
+            //logFile << " - length exceeds option space" << std::endl;
             break;
         }
         
         // 显示选项数据（前几个字节）
-        logFile << ", data=";
-        for (DWORD j = 2; j < (((optLen) < ((UCHAR)6)) ? (optLen) : ((UCHAR)6)); j++) {
-            logFile << std::hex << (int)currentOptions[i + j] << " ";
-        }
-        logFile << std::dec << std::endl;
+        // logFile << ", data=";
+        // for (DWORD j = 2; j < (((optLen) < ((UCHAR)6)) ? (optLen) : ((UCHAR)6)); j++) {
+        //     logFile << std::hex << (int)currentOptions[i + j] << " ";
+        // }
+        // logFile << std::dec << std::endl;
         
         i += optLen;
         usedSpace = i;
@@ -204,23 +205,24 @@ void AnalyzeTcpOptionsDetailed(tcphdr_ptr tcpHeader, DWORD* pUsedSpace, DWORD* p
     
     if (foundEOL) {
         *pAvailableSpace = currentOptionSpace - usedSpace;
-        logFile << "Found EOL at position " << usedSpace - 1 << std::endl;
+        //logFile << "Found EOL at position " << usedSpace - 1 << std::endl;
     } else {
         *pAvailableSpace = 40 - usedSpace; // 最大40字节减去已用空间
-        logFile << "No EOL found, using implicit end at position " << usedSpace << std::endl;
+        //logFile << "[error] No EOL found, using implicit end at position " << usedSpace << std::endl;
     }
     
     // 计算需要的填充
     *pPaddingNeeded = CalculateTcpOptionPadding(TCPOPT_CUSTOM_LENGTH);
     
-    logFile << "Used space: " << usedSpace << ", Available space: " << *pAvailableSpace << std::endl;
-    logFile << "We need: " << TCPOPT_CUSTOM_LENGTH << " bytes (kind:1 + len:1 + data:" << INJECTION_DATA_SIZE << ")" << std::endl;
-    logFile << "Padding needed: " << *pPaddingNeeded << " bytes" << std::endl;
-    logFile << "Total space required: " << (TCPOPT_CUSTOM_LENGTH + *pPaddingNeeded) << " bytes" << std::endl;
+    // logFile << "Used space: " << usedSpace << ", Available space: " << *pAvailableSpace << std::endl;
+    // logFile << "We need: " << TCPOPT_CUSTOM_LENGTH << " bytes (kind:1 + len:1 + data:" << INJECTION_DATA_SIZE << ")" << std::endl;
+    // logFile << "Padding needed: " << *pPaddingNeeded << " bytes" << std::endl;
+    // logFile << "Total space required: " << (TCPOPT_CUSTOM_LENGTH + *pPaddingNeeded) << " bytes" << std::endl;
 }
 
 // 安全的TCP选项注入
-bool InjectDataAsTcpOption(ndisapi::fastio_packet_filter* ndis_api, 
+bool InjectDataAsTcpOption(ndisapi::multi_packet_filter* ndis_api, 
+                          HANDLE adapterHandle,
                           INTERMEDIATE_BUFFER* pBuffer, 
                           iphdr_ptr ipHeader, 
                           tcphdr_ptr tcpHeader) {
@@ -231,12 +233,12 @@ bool InjectDataAsTcpOption(ndisapi::fastio_packet_filter* ndis_api,
     DWORD originalTcpHeaderLength = (tcpHeader->th_off) * 4;
     DWORD basicTcpHeaderSize = 20;
     
-    logFile << "=== TCP Option Injection ===" << std::endl;
-    logFile << "Original packet size: " << originalPacketSize << std::endl;
-    logFile << "IP header length: " << ipHeaderLength << std::endl;
-    logFile << "Original TCP header length: " << originalTcpHeaderLength << std::endl;
-    logFile << "Injection data size: " << INJECTION_DATA_SIZE << " bytes" << std::endl;
-    logFile << "Total option space needed: " << TCPOPT_CUSTOM_LENGTH << " bytes" << std::endl;
+    // logFile << "=== TCP Option Injection ===" << std::endl;
+    // logFile << "Original packet size: " << originalPacketSize << std::endl;
+    // logFile << "IP header length: " << ipHeaderLength << std::endl;
+    // logFile << "Original TCP header length: " << originalTcpHeaderLength << std::endl;
+    // logFile << "Injection data size: " << INJECTION_DATA_SIZE << " bytes" << std::endl;
+    // logFile << "Total option space needed: " << TCPOPT_CUSTOM_LENGTH << " bytes" << std::endl;
     
     // 2. 详细分析TCP选项（包括填充计算）
     DWORD usedOptionSpace = 0;
@@ -247,14 +249,14 @@ bool InjectDataAsTcpOption(ndisapi::fastio_packet_filter* ndis_api,
     // 3. 检查空间是否足够（包括填充）
     DWORD totalSpaceRequired = TCPOPT_CUSTOM_LENGTH + paddingNeeded;
     if (availableSpace < totalSpaceRequired) {
-        logFile << "!!! Not enough space in TCP options !!!" << std::endl;
-        logFile << "Available: " << availableSpace << ", Needed: " << totalSpaceRequired << " (data + padding)" << std::endl;
+        logFile << "[error] Not enough space in TCP options !!!" << std::endl;
+        logFile << "[error] Available: " << availableSpace << ", Needed: " << totalSpaceRequired << " (data + padding)" << std::endl;
         
         // 提供解决方案建议
         if (availableSpace >= 4) {
-            logFile << "Suggestion: Reduce injection data to " << (availableSpace - 2 - paddingNeeded) << " bytes" << std::endl;
+            logFile << "[error] Suggestion: Reduce injection data to " << (availableSpace - 2 - paddingNeeded) << " bytes" << std::endl;
         } else {
-            logFile << "Suggestion: Remove some existing TCP options to free up space" << std::endl;
+            logFile << "[error] Suggestion: Remove some existing TCP options to free up space" << std::endl;
         }
         return false;
     }
@@ -264,15 +266,15 @@ bool InjectDataAsTcpOption(ndisapi::fastio_packet_filter* ndis_api,
     
     // 检查是否超过最大TCP头长度
     if (newTcpHeaderLength > 60) {
-        logFile << "!!! New TCP header length exceeds maximum (60 bytes) !!!" << std::endl;
-        logFile << "New length: " << newTcpHeaderLength << ", Max: 60" << std::endl;
+        logFile << "[error] New TCP header length exceeds maximum (60 bytes) !!!" << std::endl;
+        logFile << "[error] New length: " << newTcpHeaderLength << ", Max: 60" << std::endl;
         return false;
     }
     
     DWORD newPacketSize = originalPacketSize + totalSpaceRequired;
     
-    logFile << "New TCP header length: " << newTcpHeaderLength << " (including " << paddingNeeded << " bytes padding)" << std::endl;
-    logFile << "New packet size: " << newPacketSize << std::endl;
+    // logFile << "New TCP header length: " << newTcpHeaderLength << " (including " << paddingNeeded << " bytes padding)" << std::endl;
+    // logFile << "New packet size: " << newPacketSize << std::endl;
     
     // 5. 创建新的数据包缓冲区
     std::vector<BYTE> newBufferData(sizeof(INTERMEDIATE_BUFFER) + newPacketSize);
@@ -325,7 +327,7 @@ bool InjectDataAsTcpOption(ndisapi::fastio_packet_filter* ndis_api,
     
     // 12. 更新数据包长度
     pNewBuffer->m_Length = newPacketSize;
-    
+
     // 13. 重新计算校验和
     new_ip_header->ip_sum = 0;
     new_ip_header->ip_sum = CalculateIPChecksum(new_ip_header);
@@ -341,42 +343,49 @@ bool InjectDataAsTcpOption(ndisapi::fastio_packet_filter* ndis_api,
         tcpDataSize);
     
     // 14. 验证关键字段
-    logFile << "=== Final Validation ===" << std::endl;
-    logFile << "TCP data offset: " << (int)new_tcp_header->th_off << " (should be " << newTcpHeaderLength/4 << ")" << std::endl;
-    logFile << "IP total length: " << ntohs(new_ip_header->ip_len) << std::endl;
-    logFile << "Buffer length: " << pNewBuffer->m_Length << std::endl;
+    // logFile << "=== Final Validation ===" << std::endl;
+    // logFile << "TCP data offset: " << (int)new_tcp_header->th_off << " (should be " << newTcpHeaderLength/4 << ")" << std::endl;
+    // logFile << "IP total length: " << ntohs(new_ip_header->ip_len) << std::endl;
+    // logFile << "Buffer length: " << pNewBuffer->m_Length << std::endl;
     
     // 记录注入的数据内容
-    logFile << "Injected data: ";
-    for (DWORD i = 0; i < INJECTION_DATA_SIZE; i++) {
-        logFile << std::hex << (int)INJECTION_DATA[i] << " ";
-    }
-    logFile << std::dec << std::endl;
+    // logFile << "Injected data: ";
+    // for (DWORD i = 0; i < INJECTION_DATA_SIZE; i++) {
+    //     logFile << std::hex << (int)INJECTION_DATA[i] << " ";
+    // }
+    // logFile << std::dec << std::endl;
     
     // 记录填充信息
-    if (paddingNeeded > 0) {
-        logFile << "Added " << paddingNeeded << " bytes of NOP padding for alignment" << std::endl;
-    }
+    // if (paddingNeeded > 0) {
+    //     logFile << "Added " << paddingNeeded << " bytes of NOP padding for alignment" << std::endl;
+    // }
+
+    // memcpy(pBuffer->m_IBuffer, pNewBuffer->m_IBuffer, newPacketSize);
+    // pBuffer->m_Length = newPacketSize; 
+    // CNdisApi::RecalculateTCPChecksum(pBuffer);
+	// CNdisApi::RecalculateIPChecksum(pBuffer);
     
     // 15. 写入日志
-    wirteBuffer(*pNewBuffer);
+    //wirteBuffer(*pNewBuffer);
     
     // 16. 发送修改后的数据包
     ETH_REQUEST request = {0};
-    request.hAdapterHandle = pBuffer->m_hAdapter;
+    request.hAdapterHandle = adapterHandle;
     request.EthPacket.Buffer = pNewBuffer;
     
     bool bSuccess = ndis_api->SendPacketToAdapter(&request);
+
+    //bool bSuccess = true; // 假设发送成功用于测试
     
-    if (bSuccess) {
-        logFile << "=== Successfully injected " << INJECTION_DATA_SIZE << " bytes as TCP option ===" << std::endl;
-        logFile << "Custom option kind: " << static_cast<int>(TCPOPT_CUSTOM) << std::endl;
-        logFile << "Injection position: " << usedOptionSpace << std::endl;
-        logFile << "Total option length added: " << totalSpaceRequired << " bytes (data + padding)" << std::endl;
-    } else {
-        logFile << "!!! Failed to send packet with TCP option !!!" << std::endl;
-        logFile << "Error code: " << GetLastError() << std::endl;
-    }
+    // if (bSuccess) {
+    //     logFile << "=== Successfully injected " << INJECTION_DATA_SIZE << " bytes as TCP option ===" << std::endl;
+    //     logFile << "Custom option kind: " << static_cast<int>(TCPOPT_CUSTOM) << std::endl;
+    //     logFile << "Injection position: " << usedOptionSpace << std::endl;
+    //     logFile << "Total option length added: " << totalSpaceRequired << " bytes (data + padding)" << std::endl;
+    // } else {
+    //     logFile << "[error] Failed to send packet with TCP option !!!" << std::endl;
+    //     logFile << "[error] Error code: " << GetLastError() << std::endl;
+    // }
     
     return bSuccess;
 }
@@ -622,19 +631,36 @@ SERVICE_TABLE_ENTRY ServiceTable[] = {
     { NULL, NULL }
 };
 
-int main(int argc, char* argv[]) {
-	
+int Log(std::string text, size_t type) {
     logFile = std::ofstream("log.txt", std::ios::app);
-	if (!logFile.is_open()) {
+    if (!logFile.is_open()) {
 		std::cerr << "Failed to open log file." << std::endl;
 		return 0;
 	}
-	logFile << "Main run now" << std::endl;
+    switch(type) {
+        case 1: //info
+	        logFile << "[Info] " << text << std::endl;
+            break;
+        case 3: //warning
+	        logFile << "[Warning] " << text << std::endl;
+            break;
+        case 4: //error
+	        logFile << "[Error] " << text << std::endl;
+            break;
+        default:
+	        logFile << "[Info] " << text << std::endl;
+            break;
+    }
+    logFile.close();
+    return 1;
+}
+
+int main(int argc, char* argv[]) {
+	size_t TARGET_INDEX = 0;
 
 	if(argc > 1) {
 		for (int i = 1; i < argc; ++i) {
 			std::string arg = argv[i];
-			logFile << "Main arg: " << arg << std::endl;
 			if (arg == "service") {
 				if (i+1 < argc) {
 					char* serviceCmd = argv[i+1];
@@ -663,9 +689,29 @@ int main(int argc, char* argv[]) {
 				return 0;
 			} else if (arg == "restart") {
 				return 0;
+			} else if (arg == "-i") {
+				if (i+1 < argc) {
+                    TARGET_INDEX = std::stoull(argv[i+1]);
+                }
 			}
 		}
 	}
+    std::string fileName;
+    std::string pcapName;
+    if (TARGET_INDEX == 0) {
+        fileName = "log.txt";
+        pcapName = "syn.pcap";
+    }else{
+        fileName = "log" + std::to_string(TARGET_INDEX) + ".txt";
+        pcapName = "syn" + std::to_string(TARGET_INDEX) + ".pcap";
+    }
+    
+    logFile = std::ofstream(fileName, std::ios::app);
+	if (!logFile.is_open()) {
+		std::cerr << "Failed to open log file." << std::endl;
+		return 0;
+	}
+	logFile << "Main run now" << std::endl;
 
 	//if(!ServiceHelper::IsServiceRunning()){
 	if(!logFile.is_open()){ //开发阶段屏蔽服务模式
@@ -679,14 +725,14 @@ int main(int argc, char* argv[]) {
 //==============================主程序 - 开始======================================
 try {
         file_stream = pcap::pcap_file_storage();
-        file_stream.open("syn.pcap");
+        file_stream.open(pcapName);
         
 
-        std::unique_ptr<ndisapi::fastio_packet_filter> ndis_api;
+        std::unique_ptr<ndisapi::multi_packet_filter> ndis_api;
         
         // 初始化 NDIS API
-        ndis_api = std::make_unique<ndisapi::fastio_packet_filter>(
-            [](HANDLE, INTERMEDIATE_BUFFER& buffer) {
+        ndis_api = std::make_unique<ndisapi::multi_packet_filter>(
+            [](HANDLE adapter, INTERMEDIATE_BUFFER& buffer) {
                 // 入站数据包处理
                 if (auto* const ether_header = reinterpret_cast<ether_header_ptr>(buffer.m_IBuffer); 
                     ntohs(ether_header->h_proto) == ETH_P_IP) {
@@ -696,20 +742,18 @@ try {
                             reinterpret_cast<PUCHAR>(ip_header) + sizeof(DWORD) * ip_header->ip_hl);
                         
                         u_char tcpFlags = tcp_header->th_flags;
-                        logFile << "=== Incoming TCP Flags: " << static_cast<int>(tcpFlags) << " ===" << std::endl;
+                        //logFile << "=== Incoming TCP Flags: " << static_cast<int>(tcpFlags) << " ===" << std::endl;
                         
                         // 记录TCP选项信息
                         DWORD tcpHeaderLength = (tcp_header->th_off) * 4;
                         DWORD optionLength = tcpHeaderLength - 20;
-                        logFile << "TCP option length: " << optionLength << " bytes" << std::endl;
+                        //logFile << "TCP option length: " << optionLength << " bytes" << std::endl;
                     }
                 }
-                return ndisapi::fastio_packet_filter::packet_action::pass;
+                return ndisapi::multi_packet_filter::packet_action::pass;
             },
-            [&ndis_api](HANDLE, INTERMEDIATE_BUFFER& buffer) {
+            [&ndis_api](HANDLE adapterHandle, INTERMEDIATE_BUFFER& buffer) {
                 // 出站数据包处理
-				// 进程过滤检查
-
                 if (auto* const ether_header = reinterpret_cast<ether_header_ptr>(buffer.m_IBuffer); 
                     ntohs(ether_header->h_proto) == ETH_P_IP) { // 处理IPv4
                     if (auto* const ip_header = reinterpret_cast<iphdr_ptr>(ether_header + 1); 
@@ -717,33 +761,73 @@ try {
 
                         auto* const tcp_header = reinterpret_cast<tcphdr_ptr>(
                             reinterpret_cast<PUCHAR>(ip_header) + sizeof(DWORD) * ip_header->ip_hl);
+
+						// std::wstring _process = ProcessFilter::queryProcessByBuffer2(ip_header, tcp_header);
+						// std::string proStr = std::string(_process.begin(), _process.end());
+						// if(proStr!="msedge.exe" &&
+						//    proStr!="chrome.exe" &&
+						//    proStr!="firefox.exe" ){
+						// 	logFile << "Process: " << proStr << " Blocked" << std::endl;
+						// 	return ndisapi::multi_packet_filter::packet_action::drop;
+						// }
+
                         
-						std::wstring _process = ProcessFilter::queryProcessByBuffer2(ip_header, tcp_header);
-						std::string proStr = std::string(_process.begin(), _process.end());
-						if(proStr!="msedge.exe" &&
-						   proStr!="chrome.exe" &&
-						   proStr!="firefox.exe" ){
-							logFile << "Process: " << proStr << "Blocked" << std::endl;
-							return ndisapi::fastio_packet_filter::packet_action::drop;
-						}
-						logFile << "Process: " << std::string(_process.begin(), _process.end()) << std::endl;
+//=======================test process get==========================
+                            auto process = iphelper::process_lookup<net::ip_address_v4>::get_process_helper().
+                                lookup_process_for_tcp<false>(net::ip_session<net::ip_address_v4>{
+                                    ip_header->ip_src, ip_header->ip_dst, ntohs(tcp_header->th_sport),
+                                    ntohs(tcp_header->th_dport)
+                                });
+
+                            if (!process)
+                            {
+                                iphelper::process_lookup<net::ip_address_v4>::get_process_helper().actualize(true, false);
+                                process = iphelper::process_lookup<net::ip_address_v4>::get_process_helper().
+                                    lookup_process_for_tcp<true>(net::ip_session<net::ip_address_v4>{
+                                        ip_header->ip_src, ip_header->ip_dst, ntohs(tcp_header->th_sport),
+                                        ntohs(tcp_header->th_dport)
+                                    });
+                            }
+                            auto process_path = process->path_name;
+                            auto process_id = process->id;
+                            auto WproStr = process->name;
+                            std::string proStr = std::string(WproStr.begin(), WproStr.end());
+                            auto sha256 = Sha256Helper::CalculateFileSHA256(process_path);
+                            // logFile << "Process: " << proStr << " Path: " << std::string(process_path.begin(), process_path.end()) << std::endl;
+                            // logFile << "ProcessId: " << static_cast<int>(process_id) << std::endl;
+                            // logFile << "SHA256: " << sha256 << std::endl;
+//=======================test process get==========================
+                        
+
+
+                        u_long tcpIp = ip_header->ip_dst.S_un.S_addr;
+                        //u_char tcpPort = tcp_header->th_dport;
+                        struct in_addr addr;
+                        addr.S_un.S_addr = tcpIp;
 
                         u_char tcpFlags = tcp_header->th_flags;
-                        logFile << "=== Outgoing TCP Flags: " << static_cast<int>(tcpFlags) << " ===" << std::endl;
+                        //logFile << "=== Outgoing TCP Flags: " << static_cast<int>(tcpFlags) << " ===" << std::endl;
 
                         // 记录TCP头信息
                         DWORD tcpHeaderLength = (tcp_header->th_off) * 4;
-                        logFile << "TCP header length: " << tcpHeaderLength << " (data offset: " << tcp_header->th_off << ")" << std::endl;
+                        //logFile << "TCP header length: " << tcpHeaderLength << " (data offset: " << tcp_header->th_off << ")" << std::endl;
 
                         // 检查SYN包
                         if ((tcpFlags & TH_SYN) && !(tcpFlags & TH_ACK)) {
-                            logFile << "=== SYN Packet Detected ===" << std::endl;
-                            file_stream << buffer;
-                            
+
+                            logFile << "============== SYN Packet Detected ============== [" 
+                            << static_cast<int>(addr.S_un.S_un_b.s_b1) << "."
+                            << static_cast<int>(addr.S_un.S_un_b.s_b2) << "."
+                            << static_cast<int>(addr.S_un.S_un_b.s_b3) << "."
+                            << static_cast<int>(addr.S_un.S_un_b.s_b4)
+                            << "]" << std::endl;
+
+
+
                             // 使用TCP选项方式注入数据
-                            if (InjectDataAsTcpOption(ndis_api.get(), &buffer, ip_header, tcp_header)) {
-                                logFile << "=== TCP option injection successful, dropping original ===" << std::endl;
-                                return ndisapi::fastio_packet_filter::packet_action::drop;
+                            if (InjectDataAsTcpOption(ndis_api.get(), adapterHandle, &buffer, ip_header, tcp_header)) {
+                                //logFile << "=== TCP option injection successful, dropping original ===" << std::endl;
+                                return ndisapi::multi_packet_filter::packet_action::pass;
                             } else {
                                 logFile << "!!! TCP option injection failed, passing original !!!" << std::endl;
                             }
@@ -760,9 +844,8 @@ try {
 						ip_header, buffer.m_Length - ETHER_HEADER_LENGTH); header && protocol == IPPROTO_TCP)
 					{}
 				}
-                return ndisapi::fastio_packet_filter::packet_action::pass;
-            }, 
-            true);
+                return ndisapi::multi_packet_filter::packet_action::pass;
+            });
 
         if (ndis_api->IsDriverLoaded()) {
             std::cout << "WinpkFilter is loaded" << std::endl << std::endl;
@@ -818,16 +901,25 @@ try {
 		std::cout << "default interface: " << defaultAdapterInfo.friendlyName << std::endl;
 		for (auto& e : ndis_api->get_interface_names_list()) {
 			std::cout << ++index << ")\t" << e << std::endl;
-			if (defaultAdapterInfo.friendlyName.find(e) != std::string::npos) {
-				break;
-			}
+			// if (defaultAdapterInfo.friendlyName.find(e) != std::string::npos) {
+			// 	break;
+			// }
 		}
+        std::vector<size_t> adapters = {1, 7};
+        ndis_api->start_filters(adapters);
 
-        ndis_api->start_filter(index - 1);
+        // if(TARGET_INDEX == 0){
+        //     std::cout << std::endl << "Select interface to filter:";
+        //     std::cin >> index;
+        //     ndis_api->start_filter(index - 1);
+        // }else{
+        //     ndis_api->start_filter(TARGET_INDEX - 1);
+        // }
 
         std::cout << "Press any key to stop filtering" << std::endl;
         std::ignore = _getch();
 
+        ndis_api->stop_all_filters();
         logFile.close();
         std::cout << "Exiting..." << std::endl;
     }

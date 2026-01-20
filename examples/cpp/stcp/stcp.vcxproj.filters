@@ -33,7 +33,7 @@
     <ClCompile Include="service_ctl.h">
       <Filter>Header Files</Filter>
     </ClCompile>
-    <ClInclude Include="..\common\ndisapi\fastio_packet_filter.h">
+    <ClInclude Include="..\common\ndisapi\multi_packet_filter.h">
       <Filter>Header Files\common\ndisapi</Filter>
     </ClInclude>
     <ClInclude Include="..\common\pcap\pcap.h">
@@ -61,6 +61,12 @@
     </ClCompile>
     <ClCompile Include="service_ctl.cpp">
       <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="get_sha256.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="get_sha256.h">
+      <Filter>Header Files</Filter>
     </ClCompile>
   </ItemGroup>
   <ItemGroup>

@@ -271,12 +271,13 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClInclude Include="..\common\ndisapi\fastio_packet_filter.h" />
+    <ClInclude Include="..\common\ndisapi\multi_packet_filter.h" />
     <ClInclude Include="..\common\pcap\pcap.h" />
     <ClInclude Include="..\common\pcap\pcap_file_storage.h" />
     <ClInclude Include="aes_128_helper.h" />
     <ClCompile Include="process_filter.h" />
     <ClCompile Include="service_ctl.h" />
+    <ClCompile Include="get_sha256.h" />
     <ClInclude Include="pch.h" />
   </ItemGroup>
   <ItemGroup>
@@ -284,6 +285,9 @@
     <ClCompile Include="aes_128_helper.cpp" />
     <ClCompile Include="process_filter.cpp" />
     <ClCompile Include="service_ctl.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="get_sha256.cpp">
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
     </ClCompile>
     <ClCompile Include="pch.cpp">

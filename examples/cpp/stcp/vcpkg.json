@@ -1,5 +1,7 @@
 {
   "dependencies": [
-    "ms-gsl"
+    "ms-gsl",
+    "yaml-cpp",
+    "nlohmann-json"
   ]
 }

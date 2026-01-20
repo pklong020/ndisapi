@@ -55,6 +55,6 @@
 #include "../common/iphelper/process_lookup.h"
 #include "../common/iphelper/network_adapter_info.h"
 #include "../common/ndisapi/network_adapter.h"
-#include "../common/ndisapi/fastio_packet_filter.h"
+#include "../common/ndisapi/multi_packet_filter.h"
 
 #endif //PCH_H
