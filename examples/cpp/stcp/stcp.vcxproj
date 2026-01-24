@@ -278,6 +278,7 @@
     <ClCompile Include="process_filter.h" />
     <ClCompile Include="service_ctl.h" />
     <ClCompile Include="get_sha256.h" />
+    <ClCompile Include="config_manager.h" />
     <ClInclude Include="pch.h" />
   </ItemGroup>
   <ItemGroup>
@@ -285,6 +286,9 @@
     <ClCompile Include="aes_128_helper.cpp" />
     <ClCompile Include="process_filter.cpp" />
     <ClCompile Include="service_ctl.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="config_manager.cpp">
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
     </ClCompile>
     <ClCompile Include="get_sha256.cpp">

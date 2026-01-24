@@ -9,6 +9,7 @@
 #ifndef PCH_H
 #define PCH_H
 
+#include <ws2tcpip.h>
 #include <winsock2.h>
 #include <in6addr.h>
 #include <tchar.h>
@@ -56,5 +57,7 @@
 #include "../common/iphelper/network_adapter_info.h"
 #include "../common/ndisapi/network_adapter.h"
 #include "../common/ndisapi/multi_packet_filter.h"
+
+#include "../../../include/BS_thread_pool.hpp"
 
 #endif //PCH_H

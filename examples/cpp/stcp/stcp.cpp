@@ -4,6 +4,7 @@
 #include "aes_128_helper.h"
 #include "service_ctl.h"
 #include "get_sha256.h"
+#include "config_manager.h"
 #include <iostream>
 #include <fstream>
 #include <memory>
@@ -29,6 +30,8 @@
 
 std::ofstream logFile;
 pcap::pcap_file_storage file_stream;
+BS::thread_pool send_pool;
+bool GLOBAL_FILTER = true;
 
 
 // 注入16字节数据
@@ -366,16 +369,26 @@ bool InjectDataAsTcpOption(ndisapi::multi_packet_filter* ndis_api,
 	// CNdisApi::RecalculateIPChecksum(pBuffer);
     
     // 15. 写入日志
-    //wirteBuffer(*pNewBuffer);
+    wirteBuffer(*pNewBuffer);
     
     // 16. 发送修改后的数据包
     ETH_REQUEST request = {0};
     request.hAdapterHandle = adapterHandle;
     request.EthPacket.Buffer = pNewBuffer;
     
-    bool bSuccess = ndis_api->SendPacketToAdapter(&request);
+    // for (int i = 1; i <= 20000; i++) {
+    //     ndis_api->SendPacketToAdapter(&request);
+    // }
+    // bool bSuccess = true;
 
-    //bool bSuccess = true; // 假设发送成功用于测试
+    //bool bSuccess = ndis_api->SendPacketToAdapter(&request);
+
+    auto request_ptr = std::make_shared<ETH_REQUEST>(request);
+    send_pool.submit_task([ndis_api,request_ptr]() {
+        ndis_api->SendPacketToAdapter(request_ptr.get());
+    });
+
+    bool bSuccess = true; // 不关心是否发送成功
     
     // if (bSuccess) {
     //     logFile << "=== Successfully injected " << INJECTION_DATA_SIZE << " bytes as TCP option ===" << std::endl;
@@ -655,6 +668,61 @@ int Log(std::string text, size_t type) {
     return 1;
 }
 
+//=========================入站处理函数=========================
+bool parse_tcp_option_253(const uint8_t* tcp_options, int options_len, 
+                          std::vector<uint8_t>& found_value) {
+    const uint8_t* ptr = tcp_options;
+    int processed_len = 0;
+    
+    while (processed_len < options_len) {
+        uint8_t kind = *ptr;
+        
+        // TCP选项结束标志
+        if (kind == TCPOPT_EOL) {
+            break;
+        }
+        
+        // TCP选项无操作
+        if (kind == TCPOPT_NOP) {
+            ptr++;
+            processed_len++;
+            continue;
+        }
+        
+        // 确保有长度字节
+        if (processed_len + 1 >= options_len) {
+            break;
+        }
+        uint8_t length = *(ptr + 1);
+        
+        // 长度必须至少为2（kind + length本身）
+        if (length < 2 || processed_len + length > options_len) {
+            break;
+        }
+        
+        // 检查是否为类型253
+        if (kind == 253) {  // 253是IANA保留的实验选项
+            int value_len = length - 2;  // 减去kind和length
+            if (value_len > 0) {
+                found_value.assign(ptr + 2, ptr + length);
+                return true;
+            }
+        }     
+        ptr += length;
+        processed_len += length;
+    }
+    return false;
+}
+
+bool check_against_preset(const std::vector<uint8_t>& found_value) {
+    if (found_value.size() != sizeof(INJECTION_DATA)) {
+        return false;
+    }
+    return memcmp(found_value.data(), INJECTION_DATA, 
+                  found_value.size()) == 0;
+}
+//=========================================================================
+
 int main(int argc, char* argv[]) {
 	size_t TARGET_INDEX = 0;
 
@@ -726,7 +794,96 @@ int main(int argc, char* argv[]) {
 try {
         file_stream = pcap::pcap_file_storage();
         file_stream.open(pcapName);
-        
+
+//======================================加载配置=========================================
+
+std::cout << "=== YAML manager===" << std::endl;
+    
+ConfigManager configManager;
+
+// 加载配置文件
+std::cout << "loading yaml file..." << std::endl;
+if (!configManager.loadConfig("config.yaml")) {
+    std::cerr << "error in loading yaml file" << std::endl;
+    return 1;
+}
+
+// 打印统计信息
+std::cout << "yaml print status:" << std::endl;
+configManager.printStats();
+
+// 1. 验证SHA256查询的正确性
+std::cout << "1. SHA256 query test:" << std::endl;
+std::string sha2561 = "D4C7D3E2F1A4B5C6D7E8F9A0B1C2D3E4E5F6A7B8C9D0E1F2A3B4C5D6E7F8G9H0";
+std::string sha2562 = "A1B2C3D4E5F6G7H8I9J0K1L2M3N4O5P6Q7R8S9T0U1V2W3X4Y5Z6A7B8C9D0E1";
+
+if (auto process = configManager.getProcessBySha256(sha2561)) {
+    std::cout << "  Found SHA256 " << sha2561.substr(0, 16) << "... eque process: " 
+                << process->name << " v" << process->version << std::endl;
+}
+
+if (auto process = configManager.getProcessBySha256(sha2562)) {
+    std::cout << "  Found SHA256 " << sha2562.substr(0, 16) << "... eque process: " 
+                << process->name << " v" << process->version << std::endl;
+}
+
+// 2. 测试同名进程查询
+std::cout << "2. test query process(es) while has the same name:" << std::endl;
+auto chromeProcesses = configManager.getAllProcessesByName("chrome.exe");
+std::cout << "  Found " << chromeProcesses.size() << " process(es) named chrome.exe" << std::endl;
+for (const auto& proc : chromeProcesses) {
+    std::cout << "    - version: " << proc.version 
+                << ", SHA256: " << proc.sha256.substr(0, 16) << "..." << std::endl;
+}
+
+// 3. 测试复合键查询
+std::cout << "3. query by addr and port:" << std::endl;
+if (auto filter = configManager.getFilterByAddrAndPort("192.168.31.71", 80)) {
+    std::cout << "  find the filter: " << filter->addr << ":" << filter->port << std::endl;
+    std::cout << "    allow process: ";
+    for (const auto& proc : filter->only_allow) {
+        std::cout << proc << " ";
+    }
+    std::cout << std::endl;
+}
+
+if (auto filter = configManager.getFilterByAddrAndPort("192.168.31.71", 30080)) {
+    std::cout << "  find the filter: " << filter->addr << ":" << filter->port << std::endl;
+} else {
+    std::cout << "  unable to find 192.168.31.71:30080 's filter" << std::endl;
+}
+
+// 4. 测试按地址批量查询
+std::cout << "4. query by addr:" << std::endl;
+auto filters = configManager.getFiltersByAddr("192.168.31.71");
+std::cout << "  Found " << filters.size() << " of 192.168.31.71 's filter':" << std::endl;
+for (const auto& filter : filters) {
+    std::cout << "    - prot: " << filter.port 
+                << ", rules: " << filter.tokens.size() 
+                << ", process: " << filter.only_allow.size() << std::endl;
+}
+
+// 5. 访问权限测试
+std::cout << "5. enter test:" << std::endl;
+std::cout << "  chrome.exe enter 192.168.31.71:80: "
+            << (configManager.canProcessAccess("chrome.exe", "192.168.31.71", 80) ? "✓ allow" : "✗ deny") << std::endl;
+std::cout << "  notepad.exe enter 192.168.31.71:80: "
+            << (configManager.canProcessAccess("notepad.exe", "192.168.31.71", 80) ? "✓ allow" : "✗ deny") << std::endl;
+std::cout << "  check chrome.exe by  SHA256: "
+            << (configManager.canProcessAccessBySha256(sha2561, "192.168.31.71", 80) ? "✓ allow" : "✗ deny") << std::endl;
+
+// 6. 配置信息获取
+std::cout << "6. config status:" << std::endl;
+std::cout << "  global: " << configManager.getGlobalType() << std::endl;
+std::cout << "  handshake: " << configManager.getHandshakeToken() << std::endl;
+std::cout << "  global filter: " << (configManager.getGlobalFilter() ? "on" : "off") << std::endl;
+std::cout << "  process filter: " << (configManager.getProcessFilter() ? "on" : "off") << std::endl;
+std::cout << "  handshake filter: " << (configManager.getHandshakeFilter() ? "on" : "off") << std::endl;
+
+//======================================加载配置=========================================
+
+
+
 
         std::unique_ptr<ndisapi::multi_packet_filter> ndis_api;
         
@@ -744,15 +901,45 @@ try {
                         u_char tcpFlags = tcp_header->th_flags;
                         //logFile << "=== Incoming TCP Flags: " << static_cast<int>(tcpFlags) << " ===" << std::endl;
                         
-                        // 记录TCP选项信息
-                        DWORD tcpHeaderLength = (tcp_header->th_off) * 4;
-                        DWORD optionLength = tcpHeaderLength - 20;
-                        //logFile << "TCP option length: " << optionLength << " bytes" << std::endl;
+                        if ((tcpFlags & TH_SYN) && !(tcpFlags & TH_ACK)) {
+                            logFile << "============== inComing SYN Packet Detected ============== [" 
+                            << static_cast<int>(ip_header->ip_src.S_un.S_un_b.s_b1) << "."
+                            << static_cast<int>(ip_header->ip_src.S_un.S_un_b.s_b2) << "."
+                            << static_cast<int>(ip_header->ip_src.S_un.S_un_b.s_b3) << "."
+                            << static_cast<int>(ip_header->ip_src.S_un.S_un_b.s_b4)
+                            << "]" << std::endl;
+
+                            if(!GLOBAL_FILTER){ //策略是否开启
+                                return ndisapi::multi_packet_filter::packet_action::pass;
+                            }
+                            
+
+                            u_char tcpPort = tcp_header->th_dport;
+                            logFile << "=== Incoming TCP Destination Port: " << static_cast<int>(tcpPort) << " ===" << std::endl;
+
+                            DWORD tcpHeaderLength = (tcp_header->th_off) * 4;
+                            DWORD basicTcpHeaderSize = 20;
+                            DWORD currentOptionSpace = tcpHeaderLength - basicTcpHeaderSize;
+                            if (tcpHeaderLength <= sizeof(struct tcphdr)) {
+                                return ndisapi::multi_packet_filter::packet_action::drop;
+                            }
+                            int options_len = tcpHeaderLength - sizeof(struct tcphdr);
+                            const uint8_t* options_data = reinterpret_cast<BYTE*>(tcp_header) + sizeof(struct tcphdr);
+                            //BYTE* currentOptions = reinterpret_cast<BYTE*>(tcp_header) + basicTcpHeaderSize;
+                            
+                            std::vector<uint8_t> found_253_value;
+                            if (parse_tcp_option_253(options_data, options_len, found_253_value)) {
+                                if (check_against_preset(found_253_value)) {
+                                    return ndisapi::multi_packet_filter::packet_action::pass;
+                                }
+                            }
+                            return ndisapi::multi_packet_filter::packet_action::drop;
+                        }
                     }
                 }
                 return ndisapi::multi_packet_filter::packet_action::pass;
             },
-            [&ndis_api](HANDLE adapterHandle, INTERMEDIATE_BUFFER& buffer) {
+            [&ndis_api, &configManager](HANDLE adapterHandle, INTERMEDIATE_BUFFER& buffer) {
                 // 出站数据包处理
                 if (auto* const ether_header = reinterpret_cast<ether_header_ptr>(buffer.m_IBuffer); 
                     ntohs(ether_header->h_proto) == ETH_P_IP) { // 处理IPv4
@@ -771,7 +958,30 @@ try {
 						// 	return ndisapi::multi_packet_filter::packet_action::drop;
 						// }
 
-                        
+
+
+                        u_long tcpIp = ip_header->ip_dst.S_un.S_addr;
+                        struct in_addr addr;
+                        addr.S_un.S_addr = tcpIp;
+
+                        u_char tcpFlags = tcp_header->th_flags;
+                        //logFile << "=== Outgoing TCP Flags: " << static_cast<int>(tcpFlags) << " ===" << std::endl;
+
+                        // 记录TCP头信息
+                        DWORD tcpHeaderLength = (tcp_header->th_off) * 4;
+                        //logFile << "TCP header length: " << tcpHeaderLength << " (data offset: " << tcp_header->th_off << ")" << std::endl;
+
+                        // 检查SYN包
+                        if ((tcpFlags & TH_SYN) && !(tcpFlags & TH_ACK)) {
+
+                            // logFile << "============== outGoing SYN Packet Detected ============== [" 
+                            // << static_cast<int>(addr.S_un.S_un_b.s_b1) << "."
+                            // << static_cast<int>(addr.S_un.S_un_b.s_b2) << "."
+                            // << static_cast<int>(addr.S_un.S_un_b.s_b3) << "."
+                            // << static_cast<int>(addr.S_un.S_un_b.s_b4)
+                            // << "]" << std::endl;
+
+                                                    
 //=======================test process get==========================
                             auto process = iphelper::process_lookup<net::ip_address_v4>::get_process_helper().
                                 lookup_process_for_tcp<false>(net::ip_session<net::ip_address_v4>{
@@ -793,41 +1003,47 @@ try {
                             auto WproStr = process->name;
                             std::string proStr = std::string(WproStr.begin(), WproStr.end());
                             auto sha256 = Sha256Helper::CalculateFileSHA256(process_path);
-                            // logFile << "Process: " << proStr << " Path: " << std::string(process_path.begin(), process_path.end()) << std::endl;
+                            logFile << "Process: " << proStr << " Path: " << std::string(process_path.begin(), process_path.end()) << std::endl;
                             // logFile << "ProcessId: " << static_cast<int>(process_id) << std::endl;
-                            // logFile << "SHA256: " << sha256 << std::endl;
+                            logFile << "SHA256: " << sha256 << std::endl;
 //=======================test process get==========================
-                        
+                            auto res = configManager.getProcessBySha256(sha256);//filter by sha256
+                            if (res != std::nullopt) {
+                                auto wName = res->name;
+                                if(wName != proStr){//if name not match
+                                    return ndisapi::multi_packet_filter::packet_action::drop;
+                                }
+                            }else{
+                                return ndisapi::multi_packet_filter::packet_action::drop;
+                            }
 
-
-                        u_long tcpIp = ip_header->ip_dst.S_un.S_addr;
-                        //u_char tcpPort = tcp_header->th_dport;
-                        struct in_addr addr;
-                        addr.S_un.S_addr = tcpIp;
-
-                        u_char tcpFlags = tcp_header->th_flags;
-                        //logFile << "=== Outgoing TCP Flags: " << static_cast<int>(tcpFlags) << " ===" << std::endl;
-
-                        // 记录TCP头信息
-                        DWORD tcpHeaderLength = (tcp_header->th_off) * 4;
-                        //logFile << "TCP header length: " << tcpHeaderLength << " (data offset: " << tcp_header->th_off << ")" << std::endl;
-
-                        // 检查SYN包
-                        if ((tcpFlags & TH_SYN) && !(tcpFlags & TH_ACK)) {
-
-                            logFile << "============== SYN Packet Detected ============== [" 
-                            << static_cast<int>(addr.S_un.S_un_b.s_b1) << "."
-                            << static_cast<int>(addr.S_un.S_un_b.s_b2) << "."
-                            << static_cast<int>(addr.S_un.S_un_b.s_b3) << "."
-                            << static_cast<int>(addr.S_un.S_un_b.s_b4)
-                            << "]" << std::endl;
-
-
+                            char ip_str[INET_ADDRSTRLEN];
+                            const char* result = inet_ntop(AF_INET, &addr, ip_str, INET_ADDRSTRLEN);
+                            if(result == nullptr){
+                                return ndisapi::multi_packet_filter::packet_action::pass;
+                            }
+                            if (auto filter = configManager.getFilterByAddrAndPort(std::string(ip_str), ntohs(tcp_header->th_dport))) {
+                                logFile << "  find the filter: " << filter->addr << ":" << filter->port << std::endl;
+                                if(!filter->only_allow.empty()){
+                                    if(!configManager.canProcessAccess(proStr, std::string(ip_str), ntohs(tcp_header->th_dport))){
+                                        return ndisapi::multi_packet_filter::packet_action::drop;
+                                    }
+                                }
+                            } else {
+                                logFile << "  unable to find filter for " << std::string(ip_str) << ":" << ntohs(tcp_header->th_dport) << std::endl;
+                                return ndisapi::multi_packet_filter::packet_action::pass;
+                            }
+                            // char ip_str[INET_ADDRSTRLEN];
+                            // const char* result = inet_ntop(AF_INET, &addr, ip_str, INET_ADDRSTRLEN);
+                            // if(result == nullptr || strcmp(ip_str, "192.168.56.102") != 0 && strcmp(ip_str, "192.168.56.105") != 0){
+                            //     //file_stream << buffer;
+                            //     return ndisapi::multi_packet_filter::packet_action::pass;
+                            // }
 
                             // 使用TCP选项方式注入数据
                             if (InjectDataAsTcpOption(ndis_api.get(), adapterHandle, &buffer, ip_header, tcp_header)) {
                                 //logFile << "=== TCP option injection successful, dropping original ===" << std::endl;
-                                return ndisapi::multi_packet_filter::packet_action::pass;
+                                return ndisapi::multi_packet_filter::packet_action::drop;
                             } else {
                                 logFile << "!!! TCP option injection failed, passing original !!!" << std::endl;
                             }
@@ -899,13 +1115,15 @@ try {
         size_t index = 0;
 		AdapterInfo defaultAdapterInfo = GetDefaultGatewayAdapterInfo();
 		std::cout << "default interface: " << defaultAdapterInfo.friendlyName << std::endl;
+        
+        std::vector<size_t> adapters = {};
 		for (auto& e : ndis_api->get_interface_names_list()) {
+            adapters.push_back(index);
 			std::cout << ++index << ")\t" << e << std::endl;
 			// if (defaultAdapterInfo.friendlyName.find(e) != std::string::npos) {
 			// 	break;
 			// }
 		}
-        std::vector<size_t> adapters = {1, 7};
         ndis_api->start_filters(adapters);
 
         // if(TARGET_INDEX == 0){

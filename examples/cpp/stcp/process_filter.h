@@ -8,7 +8,6 @@
 class ProcessFilter {
 public:
     bool enableProcessFilter = false;      // 是否启用进程过滤
-    std::vector<DWORD> allowedProcessIds;  // 允许的进程ID列表
 private:
     std::string targetProcessName;         // 目标进程名（可选）
 public:
