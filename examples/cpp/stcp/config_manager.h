@@ -14,33 +14,34 @@
 namespace ConfigTypes {
     struct ProcessEntry {
         std::string name;
-        std::string version;
+        std::string path;
         std::string sha256;
         std::string signature;
         
         ProcessEntry(const std::string& n, const std::string& v, 
                     const std::string& s, const std::string& sig)
-            : name(n), version(v), sha256(s), signature(sig) {}
+            : name(n), path(v), sha256(s), signature(sig) {}
     };
 
     struct ServiceEntry {
+        std::string addr;
         int port;
-        std::string type;
-        std::vector<std::string> allowed_tokens;
+        std::vector<std::string> allow_tokens;
+        std::vector<std::string> allow_ips;
         
-        ServiceEntry(int p, const std::string& t, const std::vector<std::string>& tokens)
-            : port(p), type(t), allowed_tokens(tokens) {}
+        ServiceEntry(const std::string& t, int p, const std::vector<std::string>& tokens, const std::vector<std::string>& ips)
+            : addr(t), port(p), allow_tokens(tokens), allow_ips(ips) {}
     };
 
     struct FilterListEntry {
         std::string addr;
         int port;
         std::vector<std::string> tokens;
-        std::vector<std::string> only_allow;
+        std::vector<ProcessEntry> allow_processes;
         
         FilterListEntry(const std::string& a, int p, const std::vector<std::string>& t,
-                       const std::vector<std::string>& o = {})
-            : addr(a), port(p), tokens(t), only_allow(o) {}
+                       const std::vector<ProcessEntry> o)
+            : addr(a), port(p), tokens(t), allow_processes(o) {}
     };
 
     // 用于复合键的哈希
@@ -79,13 +80,11 @@ namespace ConfigTypes {
     
     struct HandshakeConfig {
         bool filter;
-        std::string token;
         std::vector<ServiceEntry> services;
         std::vector<FilterListEntry> filterlist;
-        std::vector<std::string> whitelist;
         
-        HandshakeConfig() : filter(false), token("") {}
-        HandshakeConfig(bool f, const std::string& t) : filter(f), token(t) {}
+        HandshakeConfig() : filter(false) {}
+        HandshakeConfig(bool f, const std::string& t) : filter(f) {}
     };
     
     struct AppConfig {
@@ -123,18 +122,22 @@ public:
     bool isProcessWhitelistedBySha256(const std::string& sha256) const;
     bool isProcessWhitelistedByName(const std::string& name) const;
     std::optional<ConfigTypes::ServiceEntry> getServiceByPort(int port) const;
+    std::optional<ConfigTypes::ServiceEntry> getServiceByAddrAndPort(const std::string& addr, int port) const;
     
     // 使用复合键查询过滤器
     std::optional<ConfigTypes::FilterListEntry> getFilterByAddrAndPort(const std::string& addr, int port) const;
     
     // 获取特定地址的所有过滤器（可能多个不同端口）
     std::vector<ConfigTypes::FilterListEntry> getFiltersByAddr(const std::string& addr) const;
-    
-    bool isIPWhitelisted(const std::string& ip) const;
+ 
     bool validateToken(int port, const std::string& token) const;
     
     // 访问权限检查
-    bool canProcessAccess(const std::string& process_name, 
+    bool isTokenVerified(const std::string& token, int port) const;
+
+    bool canProcessLinkNetwork(ConfigTypes::ProcessEntry& process) const;
+
+    bool canProcessAccess(ConfigTypes::ProcessEntry& process, 
                          const std::string& addr, int port) const;
     bool canProcessAccessBySha256(const std::string& sha256,
                                  const std::string& addr, int port) const;
@@ -154,7 +157,6 @@ public:
     std::string getGlobalType() const;
     bool getProcessFilter() const;
     bool getHandshakeFilter() const;
-    std::string getHandshakeToken() const;
     
     // 工具函数
     void clear();

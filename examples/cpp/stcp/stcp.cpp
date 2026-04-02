@@ -40,6 +40,26 @@ const DWORD INJECTION_DATA_SIZE = sizeof(INJECTION_DATA);
 const UCHAR TCPOPT_CUSTOM = 253;  // 使用实验性选项类型
 const UCHAR TCPOPT_CUSTOM_LENGTH = 2 + INJECTION_DATA_SIZE;  // kind(1) + len(1) + data
 
+// 十六进制字符串转字节数组
+std::vector<BYTE> hexStringToBytes(const std::string& hex) {
+    std::vector<BYTE> bytes;
+    
+    auto hexCharToVal = [](char c) -> BYTE {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return 0;
+    };
+    
+    for (size_t i = 0; i < hex.length(); i += 2) {
+        BYTE high = hexCharToVal(hex[i]);
+        BYTE low = hexCharToVal(hex[i + 1]);
+        bytes.push_back((high << 4) | low);
+    }
+    
+    return bytes;
+}
+
 // 计算IP校验和
 USHORT CalculateIPChecksum(const iphdr_ptr ipHeader) {
     ULONG sum = 0;
@@ -120,6 +140,44 @@ USHORT CalculateTCPChecksum(
     }
     
     return (USHORT)~sum;
+}
+
+uint16_t ipv6_tcp_checksum(ipv6hdr_ptr ip6, struct tcphdr *tcp, int tcp_len) {
+    uint32_t sum = 0;
+    
+    // 伪头部（直接在栈上构造）
+    struct {
+        struct in6_addr src, dst;
+        uint32_t len;
+        uint32_t proto;  // 包含3字节0和1字节协议
+    } pseudo;
+    
+    memcpy(&pseudo.src, &ip6->ip6_src, 16);
+    memcpy(&pseudo.dst, &ip6->ip6_dst, 16);
+    pseudo.len = htonl(tcp_len);
+    pseudo.proto = htonl(IPPROTO_TCP);  // 自动补零
+    
+    // 累加伪头部
+    uint16_t *p = (uint16_t*)&pseudo;
+    for (int i = 0; i < sizeof(pseudo)/2; i++) {
+        sum += ntohs(p[i]);
+        while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    
+    // 累加 TCP 数据
+    p = (uint16_t*)tcp;
+    for (int i = 0; i < tcp_len/2; i++) {
+        sum += ntohs(p[i]);
+        while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    
+    // 处理奇数字节
+    if (tcp_len % 2) {
+        sum += ((uint8_t*)tcp)[tcp_len-1] << 8;
+        while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    
+    return htons(~sum);
 }
 
 bool wirteBuffer(INTERMEDIATE_BUFFER& buffer) {
@@ -228,7 +286,8 @@ bool InjectDataAsTcpOption(ndisapi::multi_packet_filter* ndis_api,
                           HANDLE adapterHandle,
                           INTERMEDIATE_BUFFER* pBuffer, 
                           iphdr_ptr ipHeader, 
-                          tcphdr_ptr tcpHeader) {
+                          tcphdr_ptr tcpHeader,
+                          const BYTE* injection_data) {
     
     // 1. 计算各种长度
     DWORD originalPacketSize = pBuffer->m_Length;
@@ -269,8 +328,7 @@ bool InjectDataAsTcpOption(ndisapi::multi_packet_filter* ndis_api,
     
     // 检查是否超过最大TCP头长度
     if (newTcpHeaderLength > 60) {
-        logFile << "[error] New TCP header length exceeds maximum (60 bytes) !!!" << std::endl;
-        logFile << "[error] New length: " << newTcpHeaderLength << ", Max: 60" << std::endl;
+        logFile << "[error] New TCP header length: " << newTcpHeaderLength << ", Max: 60" << std::endl;
         return false;
     }
     
@@ -314,7 +372,7 @@ bool InjectDataAsTcpOption(ndisapi::multi_packet_filter* ndis_api,
     // 设置自定义选项
     newOptions[usedOptionSpace] = TCPOPT_CUSTOM;                    // kind
     newOptions[usedOptionSpace + 1] = TCPOPT_CUSTOM_LENGTH;         // length
-    memcpy(&newOptions[usedOptionSpace + 2], INJECTION_DATA, INJECTION_DATA_SIZE);  // data
+    memcpy(&newOptions[usedOptionSpace + 2], injection_data, INJECTION_DATA_SIZE);  // data
     
     // 添加填充（NOP）
     for (DWORD i = 0; i < paddingNeeded; i++) {
@@ -331,19 +389,22 @@ bool InjectDataAsTcpOption(ndisapi::multi_packet_filter* ndis_api,
     // 12. 更新数据包长度
     pNewBuffer->m_Length = newPacketSize;
 
+    CNdisApi::RecalculateTCPChecksum(pNewBuffer);
+	CNdisApi::RecalculateIPChecksum(pNewBuffer);
+
     // 13. 重新计算校验和
-    new_ip_header->ip_sum = 0;
-    new_ip_header->ip_sum = CalculateIPChecksum(new_ip_header);
+    // new_ip_header->ip_sum = 0;
+    // new_ip_header->ip_sum = CalculateIPChecksum(new_ip_header);
     
-    new_tcp_header->th_sum = 0;
+    // new_tcp_header->th_sum = 0;
     
-    // 计算TCP校验和 - 包括新的选项和填充
-    void* newTcpData = reinterpret_cast<BYTE*>(new_tcp_header) + newTcpHeaderLength;
-    new_tcp_header->th_sum = CalculateTCPChecksum(
-        new_ip_header, 
-        new_tcp_header, 
-        newTcpData, 
-        tcpDataSize);
+    // // 计算TCP校验和 - 包括新的选项和填充
+    // void* newTcpData = reinterpret_cast<BYTE*>(new_tcp_header) + newTcpHeaderLength;
+    // new_tcp_header->th_sum = CalculateTCPChecksum(
+    //     new_ip_header, 
+    //     new_tcp_header, 
+    //     newTcpData, 
+    //     tcpDataSize);
     
     // 14. 验证关键字段
     // logFile << "=== Final Validation ===" << std::endl;
@@ -390,15 +451,153 @@ bool InjectDataAsTcpOption(ndisapi::multi_packet_filter* ndis_api,
 
     bool bSuccess = true; // 不关心是否发送成功
     
-    // if (bSuccess) {
-    //     logFile << "=== Successfully injected " << INJECTION_DATA_SIZE << " bytes as TCP option ===" << std::endl;
-    //     logFile << "Custom option kind: " << static_cast<int>(TCPOPT_CUSTOM) << std::endl;
-    //     logFile << "Injection position: " << usedOptionSpace << std::endl;
-    //     logFile << "Total option length added: " << totalSpaceRequired << " bytes (data + padding)" << std::endl;
-    // } else {
-    //     logFile << "[error] Failed to send packet with TCP option !!!" << std::endl;
-    //     logFile << "[error] Error code: " << GetLastError() << std::endl;
-    // }
+    if (bSuccess) {
+        logFile << "=== Successfully injected " << INJECTION_DATA_SIZE << " bytes as TCP option ===" << std::endl;
+        logFile << "Custom option kind: " << static_cast<int>(TCPOPT_CUSTOM) << std::endl;
+        logFile << "Injection position: " << usedOptionSpace << std::endl;
+        logFile << "Total option length added: " << totalSpaceRequired << " bytes (data + padding)" << std::endl;
+    } else {
+        logFile << "[error] Failed to send packet with TCP option !!!" << std::endl;
+        logFile << "[error] Error code: " << GetLastError() << std::endl;
+    }
+    
+    return bSuccess;
+}
+
+// 安全的TCP选项注入
+bool InjectDataAsTcpOptionForV6(ndisapi::multi_packet_filter* ndis_api, 
+                          HANDLE adapterHandle,
+                          INTERMEDIATE_BUFFER* pBuffer, 
+                          ipv6hdr_ptr ipv6Header, 
+                          tcphdr_ptr tcpHeader,
+                          const BYTE* injection_data) {
+    
+    // 1. 计算各种长度
+    DWORD originalPacketSize = pBuffer->m_Length;
+    DWORD ipv6HeaderLength = 40;  // IPv6基本头固定为40字节
+    DWORD originalTcpHeaderLength = (tcpHeader->th_off) * 4;
+    DWORD basicTcpHeaderSize = 20;
+    
+    // 2. 详细分析TCP选项（包括填充计算）
+    DWORD usedOptionSpace = 0;
+    DWORD availableSpace = 0;
+    DWORD paddingNeeded = 0;
+    AnalyzeTcpOptionsDetailed(tcpHeader, &usedOptionSpace, &availableSpace, &paddingNeeded);
+    
+    // 3. 检查空间是否足够（包括填充）
+    DWORD totalSpaceRequired = TCPOPT_CUSTOM_LENGTH + paddingNeeded;
+    if (availableSpace < totalSpaceRequired) {
+        logFile << "[error] Not enough space in TCP options !!!" << std::endl;
+        logFile << "[error] Available: " << availableSpace << ", Needed: " << totalSpaceRequired << " (data + padding)" << std::endl;
+        
+        // 提供解决方案建议
+        if (availableSpace >= 4) {
+            logFile << "[error] Suggestion: Reduce injection data to " << (availableSpace - 2 - paddingNeeded) << " bytes" << std::endl;
+        } else {
+            logFile << "[error] Suggestion: Remove some existing TCP options to free up space" << std::endl;
+        }
+        return false;
+    }
+    
+    // 4. 计算新的大小（包括填充）
+    DWORD newTcpHeaderLength = originalTcpHeaderLength + totalSpaceRequired;
+    
+    // 检查是否超过最大TCP头长度
+    if (newTcpHeaderLength > 60) {
+        logFile << "[error] New TCP header length: " << newTcpHeaderLength << ", Max: 60" << std::endl;
+        return false;
+    }
+    
+    DWORD newPacketSize = originalPacketSize + totalSpaceRequired;
+    
+    // 5. 创建新的数据包缓冲区
+    std::vector<BYTE> newBufferData(sizeof(INTERMEDIATE_BUFFER) + newPacketSize);
+    INTERMEDIATE_BUFFER* pNewBuffer = reinterpret_cast<INTERMEDIATE_BUFFER*>(newBufferData.data());
+    
+    // 6. 复制原始缓冲区
+    memcpy(pNewBuffer, pBuffer, sizeof(INTERMEDIATE_BUFFER));
+    memcpy(pNewBuffer->m_IBuffer, pBuffer->m_IBuffer, originalPacketSize);
+    
+    // 7. 获取新缓冲区中的协议头指针
+    auto* const new_ether_header = reinterpret_cast<ether_header_ptr>(pNewBuffer->m_IBuffer);
+    
+    // 获取IPv6头部（以太网类型为0x86DD）
+    auto* const new_ipv6_header = reinterpret_cast<ipv6hdr_ptr>(new_ether_header + 1);
+    
+    // 注意：IPv6可能有扩展头，需要处理
+    // 这里简化处理，假设没有扩展头，直接指向TCP头
+    auto* const new_tcp_header = reinterpret_cast<tcphdr_ptr>(
+        reinterpret_cast<PUCHAR>(new_ipv6_header) + ipv6HeaderLength);
+    
+    // 8. 移动TCP数据部分，为新的选项腾出空间
+    BYTE* originalTcpDataStart = reinterpret_cast<BYTE*>(new_tcp_header) + originalTcpHeaderLength;
+    DWORD tcpDataSize = originalPacketSize - (ETHER_HEADER_LENGTH + ipv6HeaderLength + originalTcpHeaderLength);
+    
+    if (tcpDataSize > 0) {
+        memmove(originalTcpDataStart + totalSpaceRequired, 
+                originalTcpDataStart, 
+                tcpDataSize);
+    }
+    
+    // 9. 插入TCP选项
+    BYTE* newOptions = reinterpret_cast<BYTE*>(new_tcp_header) + basicTcpHeaderSize;
+    
+    // 在已用选项空间后插入自定义选项和填充
+    memmove(newOptions + usedOptionSpace + totalSpaceRequired,
+            newOptions + usedOptionSpace,
+            originalTcpHeaderLength - basicTcpHeaderSize - usedOptionSpace);
+    
+    // 设置自定义选项
+    newOptions[usedOptionSpace] = TCPOPT_CUSTOM;                    // kind
+    newOptions[usedOptionSpace + 1] = TCPOPT_CUSTOM_LENGTH;         // length
+    memcpy(&newOptions[usedOptionSpace + 2], injection_data, INJECTION_DATA_SIZE);  // data
+    
+    // 添加填充（NOP）
+    for (DWORD i = 0; i < paddingNeeded; i++) {
+        newOptions[usedOptionSpace + TCPOPT_CUSTOM_LENGTH + i] = TCPOPT_NOP;
+    }
+    
+    // 10. 更新TCP头 - 关键步骤！
+    new_tcp_header->th_off = (newTcpHeaderLength) / 4;  // 更新数据偏移字段
+    
+    // 11. 更新IPv6头 - IPv6使用payload length而不是总长度
+    // 注意：IPv6的payload length不包括IPv6基本头，只包括扩展头和上层协议数据
+    DWORD newPayloadLength = originalPacketSize - ETHER_HEADER_LENGTH - ipv6HeaderLength + totalSpaceRequired;
+    new_ipv6_header->ip6_len = htons((u_short)newPayloadLength);
+    
+    // 12. 更新数据包长度
+    pNewBuffer->m_Length = newPacketSize;
+
+    // 13. 重新计算校验和
+    // TCP校验和需要包含IPv6伪头部
+    ipv6_tcp_checksum(new_ipv6_header, new_tcp_header, tcpDataSize + totalSpaceRequired);
+    // IPv6没有头部校验和，所以不需要计算IP校验和
+    
+    // 14. 写入日志
+    wirteBuffer(*pNewBuffer);
+    
+    // 15. 发送修改后的数据包
+    ETH_REQUEST request = {0};
+    request.hAdapterHandle = adapterHandle;
+    request.EthPacket.Buffer = pNewBuffer;
+    
+    auto request_ptr = std::make_shared<ETH_REQUEST>(request);
+    send_pool.submit_task([ndis_api, request_ptr]() {
+        ndis_api->SendPacketToAdapter(request_ptr.get());
+    });
+
+    bool bSuccess = true; // 不关心是否发送成功
+    
+    if (bSuccess) {
+        logFile << "=== Successfully injected " << INJECTION_DATA_SIZE << " bytes as TCP option (IPv6) ===" << std::endl;
+        logFile << "Custom option kind: " << static_cast<int>(TCPOPT_CUSTOM) << std::endl;
+        logFile << "Injection position: " << usedOptionSpace << std::endl;
+        logFile << "Total option length added: " << totalSpaceRequired << " bytes (data + padding)" << std::endl;
+        logFile << "IPv6 payload length: " << newPayloadLength << std::endl;
+    } else {
+        logFile << "[error] Failed to send IPv6 packet with TCP option !!!" << std::endl;
+        logFile << "[error] Error code: " << GetLastError() << std::endl;
+    }
     
     return bSuccess;
 }
@@ -763,7 +962,8 @@ int main(int argc, char* argv[]) {
                 }
 			}
 		}
-	}
+	// }else{
+    }
     std::string fileName;
     std::string pcapName;
     if (TARGET_INDEX == 0) {
@@ -795,21 +995,18 @@ try {
         file_stream = pcap::pcap_file_storage();
         file_stream.open(pcapName);
 
-//======================================加载配置=========================================
-
-std::cout << "=== YAML manager===" << std::endl;
-    
+//======================================加载配置=========================================  
 ConfigManager configManager;
 
 // 加载配置文件
-std::cout << "loading yaml file..." << std::endl;
-if (!configManager.loadConfig("config.yaml")) {
-    std::cerr << "error in loading yaml file" << std::endl;
+std::cout << "loading tactic file..." << std::endl;
+if (!configManager.loadConfig("tactics.json")) {
+    std::cerr << "error in loading tactic file" << std::endl;
     return 1;
 }
 
 // 打印统计信息
-std::cout << "yaml print status:" << std::endl;
+std::cout << "tactic print status:" << std::endl;
 configManager.printStats();
 
 // 1. 验证SHA256查询的正确性
@@ -819,12 +1016,12 @@ std::string sha2562 = "A1B2C3D4E5F6G7H8I9J0K1L2M3N4O5P6Q7R8S9T0U1V2W3X4Y5Z6A7B8C
 
 if (auto process = configManager.getProcessBySha256(sha2561)) {
     std::cout << "  Found SHA256 " << sha2561.substr(0, 16) << "... eque process: " 
-                << process->name << " v" << process->version << std::endl;
+                << process->name << " v" << process->path << std::endl;
 }
 
 if (auto process = configManager.getProcessBySha256(sha2562)) {
     std::cout << "  Found SHA256 " << sha2562.substr(0, 16) << "... eque process: " 
-                << process->name << " v" << process->version << std::endl;
+                << process->name << " v" << process->path << std::endl;
 }
 
 // 2. 测试同名进程查询
@@ -832,7 +1029,7 @@ std::cout << "2. test query process(es) while has the same name:" << std::endl;
 auto chromeProcesses = configManager.getAllProcessesByName("chrome.exe");
 std::cout << "  Found " << chromeProcesses.size() << " process(es) named chrome.exe" << std::endl;
 for (const auto& proc : chromeProcesses) {
-    std::cout << "    - version: " << proc.version 
+    std::cout << "    - version: " << proc.path 
                 << ", SHA256: " << proc.sha256.substr(0, 16) << "..." << std::endl;
 }
 
@@ -841,13 +1038,13 @@ std::cout << "3. query by addr and port:" << std::endl;
 if (auto filter = configManager.getFilterByAddrAndPort("192.168.31.71", 80)) {
     std::cout << "  find the filter: " << filter->addr << ":" << filter->port << std::endl;
     std::cout << "    allow process: ";
-    for (const auto& proc : filter->only_allow) {
-        std::cout << proc << " ";
+    for (const auto& proc : filter->allow_processes) {
+        std::cout << proc.name << " ";
     }
     std::cout << std::endl;
 }
 
-if (auto filter = configManager.getFilterByAddrAndPort("192.168.31.71", 30080)) {
+if (auto filter = configManager.getFilterByAddrAndPort("192.168.56.102", 80)) {
     std::cout << "  find the filter: " << filter->addr << ":" << filter->port << std::endl;
 } else {
     std::cout << "  unable to find 192.168.31.71:30080 's filter" << std::endl;
@@ -855,27 +1052,22 @@ if (auto filter = configManager.getFilterByAddrAndPort("192.168.31.71", 30080)) 
 
 // 4. 测试按地址批量查询
 std::cout << "4. query by addr:" << std::endl;
-auto filters = configManager.getFiltersByAddr("192.168.31.71");
-std::cout << "  Found " << filters.size() << " of 192.168.31.71 's filter':" << std::endl;
+auto filters = configManager.getFiltersByAddr("192.168.56.102");
+std::cout << "  Found " << filters.size() << " of 192.168.56.102 's filter':" << std::endl;
 for (const auto& filter : filters) {
     std::cout << "    - prot: " << filter.port 
                 << ", rules: " << filter.tokens.size() 
-                << ", process: " << filter.only_allow.size() << std::endl;
+                << ", process: " << filter.allow_processes.size() << std::endl;
 }
 
 // 5. 访问权限测试
 std::cout << "5. enter test:" << std::endl;
-std::cout << "  chrome.exe enter 192.168.31.71:80: "
-            << (configManager.canProcessAccess("chrome.exe", "192.168.31.71", 80) ? "✓ allow" : "✗ deny") << std::endl;
-std::cout << "  notepad.exe enter 192.168.31.71:80: "
-            << (configManager.canProcessAccess("notepad.exe", "192.168.31.71", 80) ? "✓ allow" : "✗ deny") << std::endl;
 std::cout << "  check chrome.exe by  SHA256: "
             << (configManager.canProcessAccessBySha256(sha2561, "192.168.31.71", 80) ? "✓ allow" : "✗ deny") << std::endl;
 
 // 6. 配置信息获取
 std::cout << "6. config status:" << std::endl;
 std::cout << "  global: " << configManager.getGlobalType() << std::endl;
-std::cout << "  handshake: " << configManager.getHandshakeToken() << std::endl;
 std::cout << "  global filter: " << (configManager.getGlobalFilter() ? "on" : "off") << std::endl;
 std::cout << "  process filter: " << (configManager.getProcessFilter() ? "on" : "off") << std::endl;
 std::cout << "  handshake filter: " << (configManager.getHandshakeFilter() ? "on" : "off") << std::endl;
@@ -886,10 +1078,11 @@ std::cout << "  handshake filter: " << (configManager.getHandshakeFilter() ? "on
 
 
         std::unique_ptr<ndisapi::multi_packet_filter> ndis_api;
+        //std::vector<std::string> allow_sports;
         
         // 初始化 NDIS API
         ndis_api = std::make_unique<ndisapi::multi_packet_filter>(
-            [](HANDLE adapter, INTERMEDIATE_BUFFER& buffer) {
+            [&configManager](HANDLE adapter, INTERMEDIATE_BUFFER& buffer) {
                 // 入站数据包处理
                 if (auto* const ether_header = reinterpret_cast<ether_header_ptr>(buffer.m_IBuffer); 
                     ntohs(ether_header->h_proto) == ETH_P_IP) {
@@ -902,20 +1095,19 @@ std::cout << "  handshake filter: " << (configManager.getHandshakeFilter() ? "on
                         //logFile << "=== Incoming TCP Flags: " << static_cast<int>(tcpFlags) << " ===" << std::endl;
                         
                         if ((tcpFlags & TH_SYN) && !(tcpFlags & TH_ACK)) {
-                            logFile << "============== inComing SYN Packet Detected ============== [" 
-                            << static_cast<int>(ip_header->ip_src.S_un.S_un_b.s_b1) << "."
-                            << static_cast<int>(ip_header->ip_src.S_un.S_un_b.s_b2) << "."
-                            << static_cast<int>(ip_header->ip_src.S_un.S_un_b.s_b3) << "."
-                            << static_cast<int>(ip_header->ip_src.S_un.S_un_b.s_b4)
-                            << "]" << std::endl;
 
-                            if(!GLOBAL_FILTER){ //策略是否开启
-                                return ndisapi::multi_packet_filter::packet_action::pass;
-                            }
+                            // if(!GLOBAL_FILTER){ //策略是否开启
+                            //     return ndisapi::multi_packet_filter::packet_action::pass;
+                            // }
                             
 
                             u_char tcpPort = tcp_header->th_dport;
-                            logFile << "=== Incoming TCP Destination Port: " << static_cast<int>(tcpPort) << " ===" << std::endl;
+                            //logFile << "=== Incoming TCP Destination Port: " << static_cast<int>(tcpPort) << " ===" << std::endl;
+
+                            auto res = configManager.getServiceByPort(ntohs(tcp_header->th_dport));
+                            if(!res.has_value()){
+                                return ndisapi::multi_packet_filter::packet_action::pass;
+                            }
 
                             DWORD tcpHeaderLength = (tcp_header->th_off) * 4;
                             DWORD basicTcpHeaderSize = 20;
@@ -929,7 +1121,10 @@ std::cout << "  handshake filter: " << (configManager.getHandshakeFilter() ? "on
                             
                             std::vector<uint8_t> found_253_value;
                             if (parse_tcp_option_253(options_data, options_len, found_253_value)) {
-                                if (check_against_preset(found_253_value)) {
+                                // if (check_against_preset(found_253_value)) {
+                                //     return ndisapi::multi_packet_filter::packet_action::pass;
+                                // }
+                                if(configManager.isTokenVerified(std::string(found_253_value.begin(), found_253_value.end()), ntohs(tcpPort))){
                                     return ndisapi::multi_packet_filter::packet_action::pass;
                                 }
                             }
@@ -937,6 +1132,46 @@ std::cout << "  handshake filter: " << (configManager.getHandshakeFilter() ? "on
                         }
                     }
                 }
+                if (auto* const ethernet_header = reinterpret_cast<ether_header_ptr>(buffer.m_IBuffer); ntohs(
+					ethernet_header->h_proto) == ETH_P_IPV6)
+				{ // 处理IPv6
+
+					auto* const ip_header = reinterpret_cast<ipv6hdr_ptr>(ethernet_header + 1);
+
+					if (const auto [header, protocol] = ipv6_parser::find_transport_header(
+						ip_header, buffer.m_Length - ETHER_HEADER_LENGTH); header && protocol == IPPROTO_TCP)
+					{
+                        auto* const tcp_header = reinterpret_cast<tcphdr_ptr>(header);
+                        u_char tcpFlags = tcp_header->th_flags;
+                        
+                        if ((tcpFlags & TH_SYN) && !(tcpFlags & TH_ACK)) {
+                            auto res = configManager.getServiceByPort(ntohs(tcp_header->th_dport));
+                            if(!res.has_value()){
+                                return ndisapi::multi_packet_filter::packet_action::pass;
+                            }
+
+                            DWORD tcpHeaderLength = (tcp_header->th_off) * 4;
+                            DWORD basicTcpHeaderSize = 20;
+                            if (tcpHeaderLength <= sizeof(struct tcphdr)) {
+                                return ndisapi::multi_packet_filter::packet_action::drop;
+                            }
+                            
+                            int options_len = tcpHeaderLength - sizeof(struct tcphdr);
+                            const uint8_t* options_data = reinterpret_cast<BYTE*>(tcp_header) + sizeof(struct tcphdr);
+                            
+                            std::vector<uint8_t> found_253_value;
+                            if (parse_tcp_option_253(options_data, options_len, found_253_value)) {
+                                // if (check_against_preset(found_253_value)) {
+                                //     return ndisapi::multi_packet_filter::packet_action::pass;
+                                // }
+                                if(configManager.isTokenVerified(std::string(found_253_value.begin(), found_253_value.end()), ntohs(tcp_header->th_dport))){
+                                    return ndisapi::multi_packet_filter::packet_action::pass;
+                                }
+                            }
+                            return ndisapi::multi_packet_filter::packet_action::drop;
+                        }
+                    }
+				}
                 return ndisapi::multi_packet_filter::packet_action::pass;
             },
             [&ndis_api, &configManager](HANDLE adapterHandle, INTERMEDIATE_BUFFER& buffer) {
@@ -951,28 +1186,28 @@ std::cout << "  handshake filter: " << (configManager.getHandshakeFilter() ? "on
 
 						// std::wstring _process = ProcessFilter::queryProcessByBuffer2(ip_header, tcp_header);
 						// std::string proStr = std::string(_process.begin(), _process.end());
-						// if(proStr!="msedge.exe" &&
+						// if(proStr!="SYSTEM" &&
 						//    proStr!="chrome.exe" &&
 						//    proStr!="firefox.exe" ){
 						// 	logFile << "Process: " << proStr << " Blocked" << std::endl;
 						// 	return ndisapi::multi_packet_filter::packet_action::drop;
 						// }
 
-
-
-                        u_long tcpIp = ip_header->ip_dst.S_un.S_addr;
-                        struct in_addr addr;
-                        addr.S_un.S_addr = tcpIp;
+                        // if(std::find(allow_sports.begin(), allow_sports.end(), std::to_string(ntohs(tcp_header->th_sport))) != allow_sports.end()){
+                        //     return ndisapi::multi_packet_filter::packet_action::pass;
+                        // }
 
                         u_char tcpFlags = tcp_header->th_flags;
                         //logFile << "=== Outgoing TCP Flags: " << static_cast<int>(tcpFlags) << " ===" << std::endl;
 
-                        // 记录TCP头信息
-                        DWORD tcpHeaderLength = (tcp_header->th_off) * 4;
-                        //logFile << "TCP header length: " << tcpHeaderLength << " (data offset: " << tcp_header->th_off << ")" << std::endl;
-
                         // 检查SYN包
                         if ((tcpFlags & TH_SYN) && !(tcpFlags & TH_ACK)) {
+                            u_long tcpIp = ip_header->ip_dst.S_un.S_addr;
+                            struct in_addr addr;
+                            addr.S_un.S_addr = tcpIp;
+                            // 记录TCP头信息
+                            DWORD tcpHeaderLength = (tcp_header->th_off) * 4;
+                            //logFile << "TCP header length: " << tcpHeaderLength << " (data offset: " << tcp_header->th_off << ")" << std::endl;
 
                             // logFile << "============== outGoing SYN Packet Detected ============== [" 
                             // << static_cast<int>(addr.S_un.S_un_b.s_b1) << "."
@@ -1005,33 +1240,47 @@ std::cout << "  handshake filter: " << (configManager.getHandshakeFilter() ? "on
                             auto sha256 = Sha256Helper::CalculateFileSHA256(process_path);
                             logFile << "Process: " << proStr << " Path: " << std::string(process_path.begin(), process_path.end()) << std::endl;
                             // logFile << "ProcessId: " << static_cast<int>(process_id) << std::endl;
-                            logFile << "SHA256: " << sha256 << std::endl;
+                            //logFile << "SHA256: " << sha256 << std::endl;
 //=======================test process get==========================
-                            auto res = configManager.getProcessBySha256(sha256);//filter by sha256
-                            if (res != std::nullopt) {
-                                auto wName = res->name;
-                                if(wName != proStr){//if name not match
-                                    return ndisapi::multi_packet_filter::packet_action::drop;
-                                }
-                            }else{
-                                return ndisapi::multi_packet_filter::packet_action::drop;
-                            }
+                            //auto res = configManager.getProcessBySha256(sha256);//filter by sha256
+                            // if (res != std::nullopt) {
+                            //     auto wName = res->name;
+                            //     if(wName != proStr){//if name not match
+                            //         return ndisapi::multi_packet_filter::packet_action::drop;
+                            //     }
+                            // }else{
+                            //     return ndisapi::multi_packet_filter::packet_action::drop;
+                            // }
+                            
+                            ConfigTypes::ProcessEntry processEntry(
+                                proStr,
+                                std::string(process_path.begin(), process_path.end()),
+                                sha256,
+                                ""
+                            );
 
                             char ip_str[INET_ADDRSTRLEN];
                             const char* result = inet_ntop(AF_INET, &addr, ip_str, INET_ADDRSTRLEN);
                             if(result == nullptr){
+                                logFile << "  error addr" << std::endl;
                                 return ndisapi::multi_packet_filter::packet_action::pass;
                             }
-                            if (auto filter = configManager.getFilterByAddrAndPort(std::string(ip_str), ntohs(tcp_header->th_dport))) {
+                            auto filter = configManager.getFilterByAddrAndPort(std::string(ip_str), ntohs(tcp_header->th_dport));
+                            if (filter) {
                                 logFile << "  find the filter: " << filter->addr << ":" << filter->port << std::endl;
-                                if(!filter->only_allow.empty()){
-                                    if(!configManager.canProcessAccess(proStr, std::string(ip_str), ntohs(tcp_header->th_dport))){
+                                if(!filter->allow_processes.empty()){
+                                    if(!configManager.canProcessAccess(processEntry, std::string(ip_str), ntohs(tcp_header->th_dport))){
+                                        logFile << "blocked process: " << proStr << ", for " << std::string(ip_str) << ":" << ntohs(tcp_header->th_dport) << std::endl;
                                         return ndisapi::multi_packet_filter::packet_action::drop;
                                     }
                                 }
                             } else {
-                                logFile << "  unable to find filter for " << std::string(ip_str) << ":" << ntohs(tcp_header->th_dport) << std::endl;
-                                return ndisapi::multi_packet_filter::packet_action::pass;
+                                if(!configManager.canProcessLinkNetwork(processEntry)){
+                                    logFile << "blocked process: " << proStr << ", for Network" << std::endl;
+                                    return ndisapi::multi_packet_filter::packet_action::drop;
+                                }else{
+                                    return ndisapi::multi_packet_filter::packet_action::pass;
+                                }
                             }
                             // char ip_str[INET_ADDRSTRLEN];
                             // const char* result = inet_ntop(AF_INET, &addr, ip_str, INET_ADDRSTRLEN);
@@ -1041,16 +1290,32 @@ std::cout << "  handshake filter: " << (configManager.getHandshakeFilter() ? "on
                             // }
 
                             // 使用TCP选项方式注入数据
-                            if (InjectDataAsTcpOption(ndis_api.get(), adapterHandle, &buffer, ip_header, tcp_header)) {
+                            BYTE injection_data; // 16字节数据
+                            auto timestamp = std::chrono::duration_cast<std::chrono::seconds>(
+                                std::chrono::system_clock::now().time_since_epoch()
+                            ).count();
+                            // 截取后6位
+                            int last_6_digits = timestamp % 1000000;
+                            std::string last_6_str = last_6_digits>100000 ? std::to_string(last_6_digits):std::string("0") + std::to_string(last_6_digits);
+                            std::string pre_inject_str = filter->tokens[0] + last_6_str + last_6_str;
+                            logFile << "=== inject data: "<< pre_inject_str << std::endl;
+                            std::vector<BYTE> byteArray = hexStringToBytes(pre_inject_str);
+                            const BYTE* correctPtr = byteArray.data();
+                            std::cout << "正确字节数据: ";
+                            for (size_t i = 0; i < byteArray.size(); i++) {
+                                printf("%02X ", correctPtr[i]);
+                            }
+                            
+                            if (InjectDataAsTcpOption(ndis_api.get(), adapterHandle, &buffer, ip_header, tcp_header, correctPtr)) {
                                 //logFile << "=== TCP option injection successful, dropping original ===" << std::endl;
                                 return ndisapi::multi_packet_filter::packet_action::drop;
                             } else {
-                                logFile << "!!! TCP option injection failed, passing original !!!" << std::endl;
+                                //logFile << "!!! TCP option injection failed, passing original !!!" << std::endl;
                             }
+                            //allow_sports.push_back(std::to_string(ntohs(tcp_header->th_sport)));
                         }
                     }
-                }
-				if (auto* const ethernet_header = reinterpret_cast<ether_header_ptr>(buffer.m_IBuffer); ntohs(
+                }else if (auto* const ethernet_header = reinterpret_cast<ether_header_ptr>(buffer.m_IBuffer); ntohs(
 					ethernet_header->h_proto) == ETH_P_IPV6)
 				{ // 处理IPv6
 
@@ -1058,7 +1323,98 @@ std::cout << "  handshake filter: " << (configManager.getHandshakeFilter() ? "on
 
 					if (const auto [header, protocol] = ipv6_parser::find_transport_header(
 						ip_header, buffer.m_Length - ETHER_HEADER_LENGTH); header && protocol == IPPROTO_TCP)
-					{}
+					{
+                        auto* const tcp_header = reinterpret_cast<tcphdr_ptr>(header);
+
+                        u_char tcpFlags = tcp_header->th_flags;
+                        //logFile << "=== Outgoing TCP Flags: " << static_cast<int>(tcpFlags) << " ===" << std::endl;
+
+                        // 记录TCP头信息
+                        DWORD tcpHeaderLength = (tcp_header->th_off) * 4;
+                        //logFile << "TCP header length: " << tcpHeaderLength << " (data offset: " << tcp_header->th_off << ")" << std::endl;
+
+                        // 检查SYN包
+                        if ((tcpFlags & TH_SYN) && !(tcpFlags & TH_ACK)) {
+                            logFile << "=== Ipv6 SYN ===" << std::endl;
+                            auto process = iphelper::process_lookup<net::ip_address_v6>::get_process_helper().
+                                lookup_process_for_tcp<false>(
+                                    net::ip_session<net::ip_address_v6>(ip_header->ip6_src, ip_header->ip6_dst,
+                                                                        ntohs(tcp_header->th_sport),
+                                                                        ntohs(tcp_header->th_dport)));
+
+                            if (process == nullptr)
+                            {
+                                iphelper::process_lookup<net::ip_address_v6>::get_process_helper().actualize(true, false);
+                                process = iphelper::process_lookup<net::ip_address_v6>::get_process_helper().
+                                    lookup_process_for_tcp<false>(
+                                        net::ip_session<net::ip_address_v6>(ip_header->ip6_src, ip_header->ip6_dst,
+                                                                            ntohs(tcp_header->th_sport),
+                                                                            ntohs(tcp_header->th_dport)));
+                            }
+
+                            auto process_path = process->path_name;
+                            auto process_id = process->id;
+                            auto WproStr = process->name;
+                            std::string proStr = std::string(WproStr.begin(), WproStr.end());
+                            auto sha256 = Sha256Helper::CalculateFileSHA256(process_path);
+                            logFile << "Process: " << proStr << " Path: " << std::string(process_path.begin(), process_path.end()) << std::endl;
+
+                            ConfigTypes::ProcessEntry processEntry(
+                                proStr,
+                                std::string(process_path.begin(), process_path.end()),
+                                sha256,
+                                ""
+                            );
+
+                            char ip_str[INET6_ADDRSTRLEN];  // 注意是 INET6_ADDRSTRLEN
+                            const char* result = inet_ntop(AF_INET6, &ip_header->ip6_dst, ip_str, INET6_ADDRSTRLEN);
+                            if(result == nullptr){
+                                logFile << "  error addr" << std::endl;
+                                return ndisapi::multi_packet_filter::packet_action::pass;
+                            }
+                            logFile << "Target addr: " << std::string(ip_str) << ", Port: " << ntohs(tcp_header->th_dport) << std::endl;
+                            auto filter = configManager.getFilterByAddrAndPort(std::string(ip_str), ntohs(tcp_header->th_dport));
+                            if (filter) {
+                                logFile << "  find the filter: " << filter->addr << ":" << filter->port << std::endl;
+                                if(!filter->allow_processes.empty()){
+                                    if(!configManager.canProcessAccess(processEntry, std::string(ip_str), ntohs(tcp_header->th_dport))){
+                                        logFile << "blocked process: " << proStr << ", for " << std::string(ip_str) << ":" << ntohs(tcp_header->th_dport) << std::endl;
+                                        return ndisapi::multi_packet_filter::packet_action::drop;
+                                    }
+                                }
+                            } else {
+                                if(!configManager.canProcessLinkNetwork(processEntry)){
+                                    logFile << "blocked process: " << proStr << ", for Network" << std::endl;
+                                    return ndisapi::multi_packet_filter::packet_action::drop;
+                                }else{
+                                    return ndisapi::multi_packet_filter::packet_action::pass;
+                                }
+                            }
+
+                            BYTE injection_data; // 16字节数据
+                            auto timestamp = std::chrono::duration_cast<std::chrono::seconds>(
+                                std::chrono::system_clock::now().time_since_epoch()
+                            ).count();
+                            // 截取后6位
+                            int last_6_digits = timestamp % 1000000;
+                            std::string last_6_str = last_6_digits>100000 ? std::to_string(last_6_digits):std::string("0") + std::to_string(last_6_digits);
+                            std::string pre_inject_str = filter->tokens[0] + last_6_str + last_6_str;
+                            logFile << "=== inject data: "<< pre_inject_str << std::endl;
+                            std::vector<BYTE> byteArray = hexStringToBytes(pre_inject_str);
+                            const BYTE* correctPtr = byteArray.data();
+                            std::cout << "正确字节数据: ";
+                            for (size_t i = 0; i < byteArray.size(); i++) {
+                                printf("%02X ", correctPtr[i]);
+                            }
+                            
+                            if (InjectDataAsTcpOptionForV6(ndis_api.get(), adapterHandle, &buffer, ip_header, tcp_header, correctPtr)) {
+                                //logFile << "=== TCP option injection successful, dropping original ===" << std::endl;
+                                return ndisapi::multi_packet_filter::packet_action::drop;
+                            } else {
+                                //logFile << "!!! TCP option injection failed, passing original !!!" << std::endl;
+                            }
+                        }
+                    }
 				}
                 return ndisapi::multi_packet_filter::packet_action::pass;
             });
@@ -1142,7 +1498,7 @@ std::cout << "  handshake filter: " << (configManager.getHandshakeFilter() ? "on
         std::cout << "Exiting..." << std::endl;
     }
     catch (const std::exception& ex) {
-        logFile << "Exception occurred: " << ex.what() << std::endl;
+        //logFile << "Exception occurred: " << ex.what() << std::endl;
         std::cout << "Exception occurred: " << ex.what() << std::endl;
     }
 //==============================主程序 - 结束======================================

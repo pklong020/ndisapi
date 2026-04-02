@@ -1,9 +1,10 @@
 #include "config_manager.h"
-#include <yaml-cpp/yaml.h>
+#include <nlohmann/json.hpp>
 #include <iostream>
 #include <sstream>
 #include <iomanip>
 #include <algorithm>
+using json = nlohmann::json;
 
 class ConfigManager::Impl {
 private:
@@ -16,10 +17,15 @@ private:
     
     // 使用复合键的filterlist索引
     std::unordered_map<ConfigTypes::AddrPortKey, 
+                      const ConfigTypes::ServiceEntry*, 
+                      ConfigTypes::AddrPortHash> service_addr_port_index_;
+    std::unordered_map<ConfigTypes::AddrPortKey, 
                       const ConfigTypes::FilterListEntry*, 
                       ConfigTypes::AddrPortHash> filter_addr_port_index_;
     
     // 按地址组织的索引（用于批量查询）
+    std::unordered_map<std::string, 
+                      std::vector<const ConfigTypes::ServiceEntry*>> service_addr_index_;
     std::unordered_map<std::string, 
                       std::vector<const ConfigTypes::FilterListEntry*>> filter_addr_index_;
     
@@ -31,6 +37,8 @@ private:
         process_name_index_.clear();
         process_sha256_index_.clear();
         service_port_index_.clear();
+        service_addr_port_index_.clear();
+        service_addr_index_.clear();
         filter_addr_port_index_.clear();
         filter_addr_index_.clear();
     }
@@ -49,6 +57,10 @@ private:
         // 构建服务索引
         for (const auto& service : config_.handshake.services) {
             service_port_index_.emplace(service.port, &service);
+
+            ConfigTypes::AddrPortKey key(service.addr, service.port);
+            service_addr_port_index_.emplace(key, &service);
+            service_addr_index_[service.addr].push_back(&service);
         }
         
         // 构建filterlist复合索引
@@ -76,142 +88,188 @@ private:
         }
         
         combineHash(std::hash<bool>{}(config_.handshake.filter));
-        combineHash(std::hash<std::string>{}(config_.handshake.token));
         
         for (const auto& service : config_.handshake.services) {
+            combineHash(std::hash<std::string>{}(service.addr));
             combineHash(std::hash<int>{}(service.port));
-            for (const auto& token : service.allowed_tokens) {
+            for (const auto& token : service.allow_tokens) {
                 combineHash(std::hash<std::string>{}(token));
+            }
+            for (const auto& _ip : service.allow_ips) {
+                combineHash(std::hash<std::string>{}(_ip));
             }
         }
         
         for (const auto& filter : config_.handshake.filterlist) {
             combineHash(std::hash<std::string>{}(filter.addr));
             combineHash(std::hash<int>{}(filter.port));
-        }
-        
-        for (const auto& ip : config_.handshake.whitelist) {
-            combineHash(std::hash<std::string>{}(ip));
+
+            for (const auto& proc : filter.allow_processes) {
+                combineHash(std::hash<std::string>{}(proc.sha256));
+            }
         }
         
         return hash;
     }
     
-    bool parseConfig(const YAML::Node& root) {
-        try {
-            ConfigTypes::AppConfig new_config;
-            
-            // 解析global配置
-            if (root["global"]) {
-                auto global = root["global"];
-                new_config.global.filter = global["filter"].as<bool>(false);
-                new_config.global.type = global["type"].as<std::string>("");
-            }
-            
-            // 解析process配置
-            if (root["process"]) {
-                auto process = root["process"];
-                new_config.process.filter = process["filter"].as<bool>(false);
-                
-                if (process["whitelist"]) {
-                    for (const auto& item : process["whitelist"]) {
-                        new_config.process.whitelist.emplace_back(
-                            item["name"].as<std::string>(""),
-                            item["version"].as<std::string>(""),
-                            item["sha256"].as<std::string>(""),
-                            item["signture"].as<std::string>("")
-                        );
-                    }
-                }
-            }
-            
-            // 解析handshake配置
-            if (root["handshake"]) {
-                auto handshake = root["handshake"];
-                new_config.handshake.filter = handshake["filter"].as<bool>(false);
-                new_config.handshake.token = handshake["token"].as<std::string>("");
-                
-                // 解析services
-                if (handshake["services"]) {
-                    for (const auto& item : handshake["services"]) {
-                        std::vector<std::string> tokens;
-                        if (item["allowed_tokens"]) {
-                            for (const auto& token : item["allowed_tokens"]) {
-                                tokens.push_back(token.as<std::string>());
-                            }
-                        }
-                        new_config.handshake.services.emplace_back(
-                            item["port"].as<int>(0),
-                            item["type"].as<std::string>("TCP"),
-                            tokens
-                        );
-                    }
-                }
-                
-                // 解析filterlist
-                if (handshake["filterlist"]) {
-                    for (const auto& item : handshake["filterlist"]) {
-                        std::vector<std::string> tokens;
-                        if (item["tokens"]) {
-                            for (const auto& token : item["tokens"]) {
-                                tokens.push_back(token.as<std::string>());
-                            }
-                        }
-                        
-                        std::vector<std::string> only_allow;
-                        if (item["only_allow"]) {
-                            for (const auto& proc : item["only_allow"]) {
-                                only_allow.push_back(proc.as<std::string>());
-                            }
-                        }
-                        
-                        new_config.handshake.filterlist.emplace_back(
-                            item["addr"].as<std::string>(""),
-                            item["port"].as<int>(0),
-                            tokens,
-                            only_allow
-                        );
-                    }
-                }
-                
-                // 解析IP白名单
-                if (handshake["whitelist"]) {
-                    for (const auto& item : handshake["whitelist"]) {
-                        new_config.handshake.whitelist.push_back(item.as<std::string>());
-                    }
-                }
-            }
-            
-            {
-                std::unique_lock lock(config_mutex_);
-                config_ = std::move(new_config);
-                buildIndices();
-                config_hash_ = calculateHash();
-            }
-            
-            return true;
-            
-        } catch (const YAML::Exception& e) {
-            std::cerr << "YAML解析错误: " << e.what() << std::endl;
-            return false;
-        } catch (const std::exception& e) {
-            std::cerr << "配置解析错误: " << e.what() << std::endl;
-            return false;
+using json = nlohmann::json;
+
+std::string get_hash_10bytes_std(const std::string& str) {
+    std::hash<std::string> hasher;
+    size_t hash_value = hasher(str);
+    
+    std::stringstream ss;
+    ss << std::hex << std::setfill('0') << std::setw(16) << hash_value;
+    std::string hash_str = ss.str();
+    
+    // 取前10字节（20个十六进制字符）
+    return hash_str.substr(0, 20);
+}
+
+bool parseConfig(const json& root) {
+    try {
+        ConfigTypes::AppConfig new_config;
+        
+        // 解析global配置
+        if (root.contains("global")) {
+            auto global = root["global"];
+            new_config.global.filter = global.value("filter", false);
+            new_config.global.type = global.value("type", "");
         }
+        
+        // 解析process配置
+        if (root.contains("process")) {
+            auto process = root["process"];
+            new_config.process.filter = process.value("filter", false);
+            
+            if (process.contains("whitelist") && process["whitelist"].is_array()) {
+                for (const auto& item : process["whitelist"]) {
+                    new_config.process.whitelist.emplace_back(
+                        item.value("executable", ""),
+                        item.value("path", ""),
+                        item.value("sha256", ""),
+                        item.value("signature", "")
+                    );
+                }
+            }
+        }
+        
+        // 解析handshake配置
+        if (root.contains("handshake")) {
+            auto handshake = root["handshake"];
+            new_config.handshake.filter = handshake.value("filter", false);
+            
+            // 解析services
+            if (handshake.contains("services") && handshake["services"].is_array()) {
+                for (const auto& item : handshake["services"]) {
+                    std::vector<std::string> tokens;
+                    if (item.contains("allow_tokens") && item["allow_tokens"].is_array()) {
+                        if(item["tokens"].empty()){
+                            std::string default_token = get_hash_10bytes_std(item.value("addr", "") + ":" + item.value("port", ""));//默认生成一个基于地址和端口的token，保证每条规则至少有一个token
+                            tokens.push_back(default_token);
+                        }else{
+                            for (const auto& token : item["allow_tokens"]) {
+                                tokens.push_back(token.get<std::string>());
+                            }
+                        }
+                    }
+                        
+                    std::vector<std::string> ips;
+                    if (item.contains("allow_ips") && item["allow_ips"].is_array()) {
+                        for (const auto& _ip : item["allow_ips"]) {
+                            ips.push_back(_ip.get<std::string>());
+                        }
+                    }
+                    new_config.handshake.services.emplace_back(
+                        item.value("addr", ""),
+                        std::atoi(item.value("port", "").c_str()),
+                        tokens,
+                        ips
+                    );
+                }
+            }
+            
+            // 解析filterlist
+            if (handshake.contains("filterlist") && handshake["filterlist"].is_array()) {
+                for (const auto& item : handshake["filterlist"]) {
+                    std::vector<std::string> tokens;
+                    if (item.contains("tokens") && item["tokens"].is_array()) {
+                        if(item["tokens"].empty()){
+                            std::string default_token = get_hash_10bytes_std(item.value("addr", "") + ":" + item.value("port", ""));//默认生成一个基于地址和端口的token，保证每条规则至少有一个token
+                            tokens.push_back(default_token);
+                        }else{
+                            for (const auto& token : item["tokens"]) {
+                                tokens.push_back(token.get<std::string>());
+                            }
+                        }
+                    }
+                    
+                    std::vector<ConfigTypes::ProcessEntry> allow_processes;
+                    if (item.contains("allow_processes") && item["allow_processes"].is_array()) {
+                        for (const auto& proc : item["allow_processes"]) {
+                            ConfigTypes::ProcessEntry entry(
+                                proc.value("executable", ""),
+                                proc.value("path", ""),
+                                proc.value("sha256", ""),
+                                proc.value("signature", "")
+                            );
+                            allow_processes.push_back(entry);
+                        }
+                    }
+                    
+                    new_config.handshake.filterlist.emplace_back(
+                        item.value("addr", ""),
+                        std::atoi(item.value("port", "").c_str()),
+                        tokens,
+                        allow_processes
+                    );
+                }
+            }
+        }
+        
+        {
+            std::unique_lock lock(config_mutex_);
+            config_ = std::move(new_config);
+            buildIndices();
+            config_hash_ = calculateHash();
+        }
+        
+        return true;
+        
+    } catch (const json::exception& e) {
+        std::cerr << "JSON解析错误: " << e.what() << std::endl;
+        return false;
+    } catch (const std::exception& e) {
+        std::cerr << "配置解析错误: " << e.what() << std::endl;
+        return false;
     }
+}
     
 public:
     Impl() = default;
     
     bool loadConfig(const std::string& filepath) {
-        try {
-            YAML::Node root = YAML::LoadFile(filepath);
-            return parseConfig(root);
-        } catch (const std::exception& e) {
-            std::cerr << "文件加载错误: " << e.what() << std::endl;
+    try {
+        // 打开文件
+        std::ifstream file(filepath);
+        if (!file.is_open()) {
+            std::cerr << "文件打开错误: 无法打开文件 " << filepath << std::endl;
             return false;
         }
+        
+        // 解析JSON文件
+        json root = json::parse(file);
+        return parseConfig(root);
+        
+    } catch (const json::parse_error& e) {
+        std::cerr << "JSON解析错误: " << e.what() << std::endl;
+        std::cerr << "错误位置: 字节 " << e.byte << std::endl;
+        return false;
+    } catch (const std::exception& e) {
+        std::cerr << "文件加载错误: " << e.what() << std::endl;
+        return false;
     }
+}
     
     // ========== 查询接口实现 ==========
     
@@ -261,6 +319,16 @@ public:
         }
         return std::nullopt;
     }
+
+    std::optional<ConfigTypes::ServiceEntry> getServiceByAddrAndPort(const std::string& addr, int port) const {
+        std::shared_lock lock(config_mutex_);
+        ConfigTypes::AddrPortKey key(addr, port);
+        auto it = service_addr_port_index_.find(key);
+        if (it != service_addr_port_index_.end()) {
+            return *it->second;
+        }
+        return std::nullopt;
+    }
     
     std::optional<ConfigTypes::FilterListEntry> getFilterByAddrAndPort(const std::string& addr, int port) const {
         std::shared_lock lock(config_mutex_);
@@ -284,35 +352,108 @@ public:
         return result;
     }
     
-    bool isIPWhitelisted(const std::string& ip) const {
-        std::shared_lock lock(config_mutex_);
-        return std::find(config_.handshake.whitelist.begin(), 
-                        config_.handshake.whitelist.end(), ip) != config_.handshake.whitelist.end();
-    }
-    
     bool validateToken(int port, const std::string& token) const {
         auto service = getServiceByPort(port);
         if (!service.has_value()) return false;
         
-        for (const auto& allowed_token : service->allowed_tokens) {
-            if (allowed_token == token) {
+        for (const auto& allow_token : service->allow_tokens) {
+            if (allow_token == token) {
                 return true;
             }
         }
         return false;
     }
     
-    bool canProcessAccess(const std::string& process_name, 
+    bool isTokenVerified(const std::string& token, int port) const {
+        
+        auto service = getServiceByPort(port);
+        if (!service.has_value()) return false;
+        
+        for (const auto& allow_token : service->allow_tokens) {
+            if (allow_token == token) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool canProcessLinkNetwork(const ConfigTypes::ProcessEntry& entry) const {
+        std::shared_lock lock(config_mutex_);
+        
+        for (const auto& whitelist_entry : config_.process.whitelist) {
+            bool match = true;
+            
+            // 检查 executable 字段
+            if (!whitelist_entry.name.empty() && 
+                whitelist_entry.name != entry.name) {
+                match = false;
+            }
+            
+            // 检查 path 字段
+            if (match && !whitelist_entry.path.empty() && 
+                whitelist_entry.path != entry.path) {
+                match = false;
+            }
+            
+            // 检查 sha256 字段
+            if (match && !whitelist_entry.sha256.empty() && 
+                whitelist_entry.sha256 != entry.sha256) {
+                match = false;
+            }
+            
+            // 检查 signature 字段
+            if (match && !whitelist_entry.signature.empty() && 
+                whitelist_entry.signature != entry.signature) {
+                match = false;
+            }
+            
+            if (match) {
+                return true;
+            }
+        }
+        
+        return false;
+    }
+
+
+    bool canProcessAccess(ConfigTypes::ProcessEntry& entry, 
                          const std::string& addr, int port) const {
-        if (isIPWhitelisted(addr)) return true;
         
         auto filter = getFilterByAddrAndPort(addr, port);
         if (!filter.has_value()) return false;
         
-        if (!filter->only_allow.empty()) {
-            return std::find(filter->only_allow.begin(), 
-                           filter->only_allow.end(), 
-                           process_name) != filter->only_allow.end();
+        if (!filter->allow_processes.empty()) {
+            for (const auto& whitelist_entry : filter->allow_processes) {
+                bool match = true;
+                
+                // 检查 executable 字段
+                if (!whitelist_entry.name.empty() && 
+                    whitelist_entry.name != entry.name) {
+                    match = false;
+                }
+                
+                // 检查 path 字段
+                if (match && !whitelist_entry.path.empty() && 
+                    whitelist_entry.path != entry.path) {
+                    match = false;
+                }
+                
+                // 检查 sha256 字段
+                if (match && !whitelist_entry.sha256.empty() && 
+                    whitelist_entry.sha256 != entry.sha256) {
+                    match = false;
+                }
+                
+                // 检查 signature 字段
+                if (match && !whitelist_entry.signature.empty() && 
+                    whitelist_entry.signature != entry.signature) {
+                    match = false;
+                }
+                
+                if (match) {
+                    return true;
+                }
+            }
         }
         
         return true;
@@ -321,9 +462,7 @@ public:
     bool canProcessAccessBySha256(const std::string& sha256,
                                  const std::string& addr, int port) const {
         auto process = getProcessBySha256(sha256);
-        if (!process.has_value()) return false;
-        
-        return canProcessAccess(process->name, addr, port);
+        return process.has_value();
     }
     
     // ========== 批量查询接口实现 ==========
@@ -356,7 +495,6 @@ public:
             << ", filter=" << config_.process.filter << "\n";
         oss << "  Services: " << config_.handshake.services.size() << "\n";
         oss << "  Filterlist: " << config_.handshake.filterlist.size() << "\n";
-        oss << "  IP Whitelist: " << config_.handshake.whitelist.size() << "\n";
         oss << "  process name hash size: " << process_name_index_.size() << "\n";
         oss << "  process SHA256 hash size: " << process_sha256_index_.size() << "\n";
         oss << "  service port hash size: " << service_port_index_.size() << "\n";
@@ -394,11 +532,6 @@ public:
     bool getHandshakeFilter() const {
         std::shared_lock lock(config_mutex_);
         return config_.handshake.filter;
-    }
-    
-    std::string getHandshakeToken() const {
-        std::shared_lock lock(config_mutex_);
-        return config_.handshake.token;
     }
     
     // ========== 工具函数实现 ==========
@@ -456,6 +589,10 @@ std::optional<ConfigTypes::ServiceEntry> ConfigManager::getServiceByPort(int por
     return impl_->getServiceByPort(port);
 }
 
+std::optional<ConfigTypes::ServiceEntry> ConfigManager::getServiceByAddrAndPort(const std::string& addr, int port) const {
+    return impl_->getServiceByAddrAndPort(addr, port);
+}
+
 std::optional<ConfigTypes::FilterListEntry> ConfigManager::getFilterByAddrAndPort(const std::string& addr, int port) const {
     return impl_->getFilterByAddrAndPort(addr, port);
 }
@@ -464,17 +601,21 @@ std::vector<ConfigTypes::FilterListEntry> ConfigManager::getFiltersByAddr(const 
     return impl_->getFiltersByAddr(addr);
 }
 
-bool ConfigManager::isIPWhitelisted(const std::string& ip) const {
-    return impl_->isIPWhitelisted(ip);
-}
-
 bool ConfigManager::validateToken(int port, const std::string& token) const {
     return impl_->validateToken(port, token);
 }
 
-bool ConfigManager::canProcessAccess(const std::string& process_name, 
+bool ConfigManager::isTokenVerified(const std::string& token, int port) const {
+    return impl_->isTokenVerified(token, port);
+}
+
+bool ConfigManager::canProcessLinkNetwork(ConfigTypes::ProcessEntry& process) const {
+    return impl_->canProcessLinkNetwork(process);
+}
+
+bool ConfigManager::canProcessAccess(ConfigTypes::ProcessEntry& process, 
                                    const std::string& addr, int port) const {
-    return impl_->canProcessAccess(process_name, addr, port);
+    return impl_->canProcessAccess(process, addr, port);
 }
 
 bool ConfigManager::canProcessAccessBySha256(const std::string& sha256,
@@ -520,10 +661,6 @@ bool ConfigManager::getProcessFilter() const {
 
 bool ConfigManager::getHandshakeFilter() const {
     return impl_->getHandshakeFilter();
-}
-
-std::string ConfigManager::getHandshakeToken() const {
-    return impl_->getHandshakeToken();
 }
 
 void ConfigManager::clear() {
