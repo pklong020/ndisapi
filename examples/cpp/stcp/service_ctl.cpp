@@ -27,7 +27,7 @@ std::wstring ServiceHelper::GetWorkerExecutablePath() {
             currentPath = currentPath.substr(0, lastSlash + 1);
         }
         
-        g_WorkerExecutablePath = currentPath + L"stcp.exe";
+        g_WorkerExecutablePath = currentPath + L"trusted_overlay.exe";
     }
     return g_WorkerExecutablePath;
 }
@@ -271,7 +271,7 @@ bool ServiceHelper::InstallService()
         return false;
     }
     
-    std::string desStr = "A STCP security agent, Devolop by YiYunLian technology LTD";
+    std::string desStr = "Trusted Overlay security agent, Devolop by BaoDe technology LTD";
     // 设置服务描述
     int len = MultiByteToWideChar(CP_UTF8, 0, desStr.c_str(), -1, nullptr, 0);
     if (len == 0) throw std::runtime_error("Conversion failed");
@@ -341,4 +341,112 @@ bool ServiceHelper::UnInstallService()
     CloseServiceHandle(schSCManager);
     
     return true;
+}
+
+bool ServiceHelper::WaitForServiceState(const std::wstring& serviceName, DWORD targetState, DWORD timeoutMs) {
+    SC_HANDLE scm = OpenSCManager(nullptr, nullptr, SC_MANAGER_CONNECT);
+    if (!scm) {
+        std::wcerr << L"OpenSCManager failed: " << GetLastError() << std::endl;
+        return false;
+    }
+
+    SC_HANDLE svc = OpenService(scm, serviceName.c_str(), SERVICE_QUERY_STATUS);
+    if (!svc) {
+        std::wcerr << L"OpenService failed: " << GetLastError() << std::endl;
+        CloseServiceHandle(scm);
+        return false;
+    }
+
+    SERVICE_STATUS status;
+    DWORD startTick = GetTickCount();
+    while (true) {
+        if (!QueryServiceStatus(svc, &status)) {
+            std::wcerr << L"QueryServiceStatus failed: " << GetLastError() << std::endl;
+            CloseServiceHandle(svc);
+            CloseServiceHandle(scm);
+            return false;
+        }
+        if (status.dwCurrentState == targetState) {
+            CloseServiceHandle(svc);
+            CloseServiceHandle(scm);
+            return true;
+        }
+        // 检查超时
+        if (GetTickCount() - startTick >= timeoutMs) {
+            std::wcerr << L"Timeout waiting for service state " << targetState << std::endl;
+            CloseServiceHandle(svc);
+            CloseServiceHandle(scm);
+            return false;
+        }
+        Sleep(200); // 避免忙等
+    }
+}
+
+bool ServiceHelper::RestartService(const std::wstring& serviceName, DWORD timeoutMs) {
+    SC_HANDLE scm = OpenSCManager(nullptr, nullptr, SC_MANAGER_CONNECT);
+    if (!scm) {
+        std::wcerr << L"OpenSCManager failed: " << GetLastError() << std::endl;
+        return false;
+    }
+
+    // 需要同时拥有 STOP 和 START 权限，故打开时用 GENERIC_EXECUTE 或指定具体权限
+    SC_HANDLE svc = OpenService(scm, serviceName.c_str(), SERVICE_STOP | SERVICE_START | SERVICE_QUERY_STATUS);
+    if (!svc) {
+        std::wcerr << L"OpenService failed: " << GetLastError() << std::endl;
+        CloseServiceHandle(scm);
+        return false;
+    }
+
+    SERVICE_STATUS status;
+    bool success = true;
+
+    // 1) 检查当前状态，如果正在运行则停止
+    if (QueryServiceStatus(svc, &status)) {
+        if (status.dwCurrentState == SERVICE_RUNNING) {
+            std::wcout << L"Stopping service..." << std::endl;
+            if (!ControlService(svc, SERVICE_CONTROL_STOP, &status)) {
+                DWORD err = GetLastError();
+                if (err != ERROR_SERVICE_NOT_ACTIVE) {
+                    std::wcerr << L"ControlService(STOP) failed: " << err << std::endl;
+                    success = false;
+                }
+            } else {
+                // 等待停止
+                if (!WaitForServiceState(serviceName, SERVICE_STOPPED, timeoutMs)) {
+                    success = false;
+                }
+            }
+        } else if (status.dwCurrentState != SERVICE_STOPPED) {
+            // 如果服务处于其他中间状态（如 STOP_PENDING），先等待它稳定
+            std::wcout << L"Service is not stopped, waiting..." << std::endl;
+            if (!WaitForServiceState(serviceName, SERVICE_STOPPED, timeoutMs)) {
+                success = false;
+            }
+        }
+    } else {
+        success = false;
+    }
+
+    // 2) 启动服务（如果前一步成功或服务原本就是停止的）
+    if (success) {
+        std::wcout << L"Starting service..." << std::endl;
+        if (!::StartService(svc, 0, nullptr)) {
+            DWORD err = GetLastError();
+            if (err == ERROR_SERVICE_ALREADY_RUNNING) {
+                std::wcout << L"Service already running." << std::endl;
+            } else {
+                std::wcerr << L"StartService failed: " << err << std::endl;
+                success = false;
+            }
+        } else {
+            // 等待运行
+            if (!WaitForServiceState(serviceName, SERVICE_RUNNING, timeoutMs)) {
+                success = false;
+            }
+        }
+    }
+
+    CloseServiceHandle(svc);
+    CloseServiceHandle(scm);
+    return success;
 }

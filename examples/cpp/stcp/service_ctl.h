@@ -2,8 +2,8 @@
 #include "pch.h"
 #include <atomic>
 
-#define SERVICE_NAME L"StcpAgentService"
-#define SERVICE_DISPLAY_NAME L"STCP Security Agent Service"
+#define SERVICE_NAME L"TrustedOverlayAgentService"
+#define SERVICE_DISPLAY_NAME L"Trusted Overlay Security Agent Service"
 
 class ServiceHelper {
 private:
@@ -23,6 +23,8 @@ private:
     static void StopWorkerProcess();
     static bool IsWorkerProcessRunning();
     static void MonitorWorkerProcess();
+    // 内部辅助：等待服务达到指定状态
+    static bool WaitForServiceState(const std::wstring& serviceName, DWORD targetState, DWORD timeoutMs);
 
 public:
     // 服务主函数
@@ -36,4 +38,6 @@ public:
     // 工作进程路径设置
     static void SetWorkerExecutablePath(const std::wstring& path);
     static std::wstring GetWorkerExecutablePath();
+
+    static bool RestartService(const std::wstring& serviceName = SERVICE_NAME, DWORD timeoutMs = 30000);
 };

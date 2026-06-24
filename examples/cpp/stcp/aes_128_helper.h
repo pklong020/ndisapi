@@ -1,66 +1,62 @@
 #pragma once
 #include "pch.h"
 
+// AesGcmCipher.h
+#include <windows.h>
+#include <bcrypt.h>
+#include <vector>
+#include <string>
+#include <cstdint>
 
-class AESCrypto {
-private:
-    std::vector<uint8_t> key;
-    
+#pragma comment(lib, "bcrypt.lib")
+
+// token_msg 结构体（与 Linux 内核版本保持一致，1字节对齐）
+#pragma pack(push, 1)
+struct TokenMsg {
+    uint32_t nonce;       // 关联数据 (4字节)
+    uint32_t token_idx;   // 明文/密文 (4字节)
+    uint8_t  tag[12];     // 认证标签 (12字节)
+};
+#pragma pack(pop)
+
+class AesGcmTokenCrypto {
 public:
-    bool initialize(const std::vector<uint8_t>& keyData) {
-        if (keyData.size() != 16) return false;
-        key = keyData;
-        return true;
-    }
-    
-    std::vector<uint8_t> encrypt(const std::vector<uint8_t>& input) {
-        if (input.size() != 16) return {};
-        
-        std::vector<uint8_t> output(16);
-        
-        // 第一轮：简单XOR
-        for (int i = 0; i < 16; i++) {
-            output[i] = input[i] ^ key[i];
-        }
-        
-        // 第二轮：位置置换 + 加法
-        std::vector<uint8_t> temp = output;
-        for (int i = 0; i < 16; i++) {
-            int new_pos = (i * 7) % 16;  // 置换位置
-            output[new_pos] = temp[i] + key[(i + 3) % 16];
-        }
-        
-        // 第三轮：与逆序密钥XOR
-        for (int i = 0; i < 16; i++) {
-            output[i] ^= key[15 - i];
-        }
-        
-        return output;
-    }
-    
-    std::vector<uint8_t> decrypt(const std::vector<uint8_t>& input) {
-        if (input.size() != 16) return {};
-        
-        std::vector<uint8_t> output = input;
-        
-        // 反向第三轮
-        for (int i = 0; i < 16; i++) {
-            output[i] ^= key[15 - i];
-        }
-        
-        // 反向第二轮
-        std::vector<uint8_t> temp = output;
-        for (int i = 0; i < 16; i++) {
-            int original_pos = (i * 7) % 16;
-            output[i] = temp[original_pos] - key[(i + 3) % 16];
-        }
-        
-        // 反向第一轮
-        for (int i = 0; i < 16; i++) {
-            output[i] ^= key[i];
-        }
-        
-        return output;
-    }
+    // 构造函数：传入 master_secret 字符串
+    explicit AesGcmTokenCrypto(const std::string& masterSecret);
+    ~AesGcmTokenCrypto();
+
+    // 禁止拷贝和赋值
+    AesGcmTokenCrypto(const AesGcmTokenCrypto&) = delete;
+    AesGcmTokenCrypto& operator=(const AesGcmTokenCrypto&) = delete;
+
+    // 加密 token 内容（原地加密）
+    bool encrypt(TokenMsg& token);
+
+    // 解密 token 内容（原地解密）
+    bool decrypt(TokenMsg& token);
+
+private:
+    // 使用 HMAC-SHA256 从 master_secret 和输入数据派生指定长度的密钥/IV
+    bool hmacSha256(const std::vector<uint8_t>& key,
+                    const std::vector<uint8_t>& data,
+                    std::vector<uint8_t>& output);
+
+    // 根据 nonce 派生 AES-256 密钥和 IV
+    bool deriveKeyAndIv(uint32_t nonce,
+                        std::vector<uint8_t>& outKey,
+                        std::vector<uint8_t>& outIv);
+
+    // 执行 AES-GCM 加密或解密
+    bool aesGcmCrypt(bool encrypt,
+                     const std::vector<uint8_t>& key,
+                     const std::vector<uint8_t>& iv,
+                     const std::vector<uint8_t>& aad,
+                     const std::vector<uint8_t>& input,
+                     std::vector<uint8_t>& output,
+                     std::vector<uint8_t>& tag);
+
+    std::vector<uint8_t> masterSecret_;
+    BCRYPT_ALG_HANDLE hAesAlg_;      // AES 算法句柄（GCM 模式）
+    BCRYPT_ALG_HANDLE hHmacAlg_;     // HMAC-SHA256 算法句柄
 };
 

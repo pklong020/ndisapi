@@ -34,14 +34,16 @@ namespace ConfigTypes {
     };
 
     struct FilterListEntry {
+        std::string id;
         std::string addr;
         int port;
+        bool blocked;
         std::vector<std::string> tokens;
         std::vector<ProcessEntry> allow_processes;
         
-        FilterListEntry(const std::string& a, int p, const std::vector<std::string>& t,
+        FilterListEntry(const std::string& i, const std::string& a, int p, bool b, const std::vector<std::string>& t,
                        const std::vector<ProcessEntry> o)
-            : addr(a), port(p), tokens(t), allow_processes(o) {}
+            : id(i), addr(a), port(p), blocked(b), tokens(t), allow_processes(o) {}
     };
 
     // 用于复合键的哈希
@@ -88,6 +90,8 @@ namespace ConfigTypes {
     };
     
     struct AppConfig {
+        std::string identityId;
+        std::string identityName;
         GlobalConfig global;
         ProcessConfig process;
         HandshakeConfig handshake;
@@ -135,6 +139,9 @@ public:
     // 访问权限检查
     bool isTokenVerified(const std::string& token, int port) const;
 
+    //ip白名单检查
+    bool isIpAllow(const std::string& ip, int port) const;
+
     bool canProcessLinkNetwork(ConfigTypes::ProcessEntry& process) const;
 
     bool canProcessAccess(ConfigTypes::ProcessEntry& process, 
@@ -153,6 +160,8 @@ public:
     bool isLoaded() const;
     
     // 配置获取
+    std::string getIdentityId() const;
+    std::string getIdentityName() const;
     bool getGlobalFilter() const;
     std::string getGlobalType() const;
     bool getProcessFilter() const;

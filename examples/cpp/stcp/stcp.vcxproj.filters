@@ -74,6 +74,24 @@
     <ClCompile Include="get_sha256.h">
       <Filter>Header Files</Filter>
     </ClCompile>
+    <ClCompile Include="log_manager.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="CrashHandler.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="ext_protection.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="log_manager.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="CrashHandler.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
+    <ClCompile Include="ext_protection.h">
+      <Filter>Header Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <None Include="README.md" />

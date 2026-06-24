@@ -122,13 +122,21 @@ std::string get_hash_10bytes_std(const std::string& str) {
     ss << std::hex << std::setfill('0') << std::setw(16) << hash_value;
     std::string hash_str = ss.str();
     
-    // 取前10字节（20个十六进制字符）
-    return hash_str.substr(0, 20);
+    // 取前10字节（20个十六进制字符）//最新方案，取4字节
+    return hash_str.substr(0, 8);
 }
 
 bool parseConfig(const json& root) {
     try {
         ConfigTypes::AppConfig new_config;
+
+        // 解析global配置
+        if (root.contains("identityId")) {
+            auto identityId = root["identityId"];
+            auto identityName = root["identityName"];
+            new_config.identityId = identityId.get<std::string>();
+            new_config.identityName = identityName.get<std::string>();
+        }
         
         // 解析global配置
         if (root.contains("global")) {
@@ -164,7 +172,7 @@ bool parseConfig(const json& root) {
                 for (const auto& item : handshake["services"]) {
                     std::vector<std::string> tokens;
                     if (item.contains("allow_tokens") && item["allow_tokens"].is_array()) {
-                        if(item["tokens"].empty()){
+                        if(item["allow_tokens"].empty()){
                             std::string default_token = get_hash_10bytes_std(item.value("addr", "") + ":" + item.value("port", ""));//默认生成一个基于地址和端口的token，保证每条规则至少有一个token
                             tokens.push_back(default_token);
                         }else{
@@ -172,7 +180,11 @@ bool parseConfig(const json& root) {
                                 tokens.push_back(token.get<std::string>());
                             }
                         }
+                    }else{
+                        std::string default_token = get_hash_10bytes_std(item.value("addr", "") + ":" + item.value("port", ""));//默认生成一个基于地址和端口的token，保证每条规则至少有一个token
+                        tokens.push_back(default_token);
                     }
+                    
                         
                     std::vector<std::string> ips;
                     if (item.contains("allow_ips") && item["allow_ips"].is_array()) {
@@ -181,7 +193,7 @@ bool parseConfig(const json& root) {
                         }
                     }
                     new_config.handshake.services.emplace_back(
-                        item.value("addr", ""),
+                        item.value("address", ""),
                         std::atoi(item.value("port", "").c_str()),
                         tokens,
                         ips
@@ -194,7 +206,7 @@ bool parseConfig(const json& root) {
                 for (const auto& item : handshake["filterlist"]) {
                     std::vector<std::string> tokens;
                     if (item.contains("tokens") && item["tokens"].is_array()) {
-                        if(item["tokens"].empty()){
+                        if(!item["tokens"] || item["tokens"].empty()){
                             std::string default_token = get_hash_10bytes_std(item.value("addr", "") + ":" + item.value("port", ""));//默认生成一个基于地址和端口的token，保证每条规则至少有一个token
                             tokens.push_back(default_token);
                         }else{
@@ -202,6 +214,9 @@ bool parseConfig(const json& root) {
                                 tokens.push_back(token.get<std::string>());
                             }
                         }
+                    }else{
+                        std::string default_token = get_hash_10bytes_std(item.value("addr", "") + ":" + item.value("port", ""));//默认生成一个基于地址和端口的token，保证每条规则至少有一个token
+                        tokens.push_back(default_token);
                     }
                     
                     std::vector<ConfigTypes::ProcessEntry> allow_processes;
@@ -218,8 +233,10 @@ bool parseConfig(const json& root) {
                     }
                     
                     new_config.handshake.filterlist.emplace_back(
+                        item.value("id", ""),
                         item.value("addr", ""),
                         std::atoi(item.value("port", "").c_str()),
+                        bool (item.value("blocked", false)),
                         tokens,
                         allow_processes
                     );
@@ -367,10 +384,26 @@ public:
     bool isTokenVerified(const std::string& token, int port) const {
         
         auto service = getServiceByPort(port);
+        if(service){
+            std::cout << "  Found service addr: " << service->addr << std::endl;
+            std::cout << "  Found service port: " << service->port << std::endl;
+        }
         if (!service.has_value()) return false;
         
         for (const auto& allow_token : service->allow_tokens) {
             if (allow_token == token) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool isIpAllow(const std::string& ip, int port) const {
+        auto service = getServiceByPort(port);
+        if (!service.has_value()) return false;
+        
+        for (const auto& allow_ip : service->allow_ips) {
+            if (allow_ip == ip) {
                 return true;
             }
         }
@@ -514,6 +547,16 @@ public:
     
     // ========== 配置获取接口实现 ==========
     
+    std::string getIdentityId() const {
+        std::shared_lock lock(config_mutex_);
+        return config_.identityId;
+    }
+    
+    std::string getIdentityName() const {
+        std::shared_lock lock(config_mutex_);
+        return config_.identityName;
+    }
+    
     bool getGlobalFilter() const {
         std::shared_lock lock(config_mutex_);
         return config_.global.filter;
@@ -609,6 +652,10 @@ bool ConfigManager::isTokenVerified(const std::string& token, int port) const {
     return impl_->isTokenVerified(token, port);
 }
 
+bool ConfigManager::isIpAllow(const std::string& ip, int port) const {
+    return impl_->isIpAllow(ip, port);
+}
+
 bool ConfigManager::canProcessLinkNetwork(ConfigTypes::ProcessEntry& process) const {
     return impl_->canProcessLinkNetwork(process);
 }
@@ -645,6 +692,14 @@ void ConfigManager::printStats() const {
 
 bool ConfigManager::isLoaded() const {
     return impl_->isLoaded();
+}
+
+std::string ConfigManager::getIdentityId() const {
+    return impl_->getIdentityId();
+}
+
+std::string ConfigManager::getIdentityName() const {
+    return impl_->getIdentityName();
 }
 
 bool ConfigManager::getGlobalFilter() const {

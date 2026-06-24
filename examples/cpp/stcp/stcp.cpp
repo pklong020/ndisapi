@@ -5,10 +5,19 @@
 #include "service_ctl.h"
 #include "get_sha256.h"
 #include "config_manager.h"
+#include "log_manager.h"
+#include "CrashHandler.h"
+#include "ext_protection.h"
 #include <iostream>
 #include <fstream>
 #include <memory>
 #include <vector>
+#include <random>
+#include <chrono>
+#include <string>
+#include <codecvt>
+#include <ctime>
+
 
 // TCP标志位定义
 #define TH_FIN  0x01
@@ -35,10 +44,45 @@ bool GLOBAL_FILTER = true;
 
 
 // 注入16字节数据
-const BYTE INJECTION_DATA[] = {0x65, 0x32, 0x68, 0x6B, 0x31, 0x68, 0x35, 0x67, 0x66, 0x7A, 0x30, 0x39, 0x33, 0x33, 0x34, 0x35};
+const BYTE INJECTION_DATA[] = {0x65, 0x32, 0x68, 0x6B, 0x31, 0x68, 0x35, 0x67, 0x66, 0x7A, 0x31, 0x68, 0x35, 0x67, 0x66, 0x7A, 0x35, 0x67, 0x66, 0x7A};
 const DWORD INJECTION_DATA_SIZE = sizeof(INJECTION_DATA);
-const UCHAR TCPOPT_CUSTOM = 253;  // 使用实验性选项类型
+const UCHAR TCPOPT_CUSTOM = TCPOPT_USER;  // 使用实验性选项类型
 const UCHAR TCPOPT_CUSTOM_LENGTH = 2 + INJECTION_DATA_SIZE;  // kind(1) + len(1) + data
+
+
+
+std::string getExeDir() {
+    char path[MAX_PATH];
+    GetModuleFileNameA(NULL, path, MAX_PATH);
+    std::string fullPath(path);
+    size_t pos = fullPath.find_last_of("\\/");
+    return fullPath.substr(0, pos + 1);  // 包含末尾的 '\'
+}
+
+int Log(std::string text, size_t type) {
+    std::string exeDir = getExeDir();
+    logFile = std::ofstream(exeDir + "\\data\\log.txt", std::ios::app);
+    if (!logFile.is_open()) {
+		std::cerr << "Failed to open log file." << std::endl;
+		return 0;
+	}
+    switch(type) {
+        case 1: //info
+	        logFile << "[Info] " << text << std::endl;
+            break;
+        case 3: //warning
+	        logFile << "[Warning] " << text << std::endl;
+            break;
+        case 4: //error
+	        logFile << "[Error] " << text << std::endl;
+            break;
+        default:
+	        logFile << "[Info] " << text << std::endl;
+            break;
+    }
+    logFile.close();
+    return 1;
+}
 
 // 十六进制字符串转字节数组
 std::vector<BYTE> hexStringToBytes(const std::string& hex) {
@@ -58,6 +102,37 @@ std::vector<BYTE> hexStringToBytes(const std::string& hex) {
     }
     
     return bytes;
+}
+
+std::string bytesToHexString(const std::vector<uint8_t>& bytes) {
+    std::stringstream ss;
+    ss << std::hex << std::setfill('0');
+    for (uint8_t byte : bytes) {
+        ss << std::setw(2) << static_cast<int>(byte);
+    }
+    return ss.str();
+}
+
+// 解析6字节大端序时间戳（毫秒）
+uint64_t parseTimestamp6Bytes(const std::vector<uint8_t>& data, size_t offset) {
+    uint64_t timestamp = 0;
+    timestamp |= static_cast<uint64_t>(data[offset + 0]) << 40;
+    timestamp |= static_cast<uint64_t>(data[offset + 1]) << 32;
+    timestamp |= static_cast<uint64_t>(data[offset + 2]) << 24;
+    timestamp |= static_cast<uint64_t>(data[offset + 3]) << 16;
+    timestamp |= static_cast<uint64_t>(data[offset + 4]) << 8;
+    timestamp |= static_cast<uint64_t>(data[offset + 5]);
+    return timestamp;
+}
+
+inline uint8_t hexPairToByte(const char* str) {
+    auto hexToNibble = [](char c) -> uint8_t {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        return 0;
+    };
+    return (hexToNibble(str[0]) << 4) | hexToNibble(str[1]);
 }
 
 // 计算IP校验和
@@ -314,12 +389,6 @@ bool InjectDataAsTcpOption(ndisapi::multi_packet_filter* ndis_api,
         logFile << "[error] Not enough space in TCP options !!!" << std::endl;
         logFile << "[error] Available: " << availableSpace << ", Needed: " << totalSpaceRequired << " (data + padding)" << std::endl;
         
-        // 提供解决方案建议
-        if (availableSpace >= 4) {
-            logFile << "[error] Suggestion: Reduce injection data to " << (availableSpace - 2 - paddingNeeded) << " bytes" << std::endl;
-        } else {
-            logFile << "[error] Suggestion: Remove some existing TCP options to free up space" << std::endl;
-        }
         return false;
     }
     
@@ -370,9 +439,9 @@ bool InjectDataAsTcpOption(ndisapi::multi_packet_filter* ndis_api,
             originalTcpHeaderLength - basicTcpHeaderSize - usedOptionSpace);
     
     // 设置自定义选项
-    newOptions[usedOptionSpace] = TCPOPT_CUSTOM;                    // kind
-    newOptions[usedOptionSpace + 1] = TCPOPT_CUSTOM_LENGTH;         // length
-    memcpy(&newOptions[usedOptionSpace + 2], injection_data, INJECTION_DATA_SIZE);  // data
+    newOptions[usedOptionSpace] = TCPOPT_CUSTOM;                    // kind/1
+    newOptions[usedOptionSpace + 1] = TCPOPT_CUSTOM_LENGTH;         // length/1
+    memcpy(&newOptions[usedOptionSpace + 2], injection_data, INJECTION_DATA_SIZE);  // data/20
     
     // 添加填充（NOP）
     for (DWORD i = 0; i < paddingNeeded; i++) {
@@ -391,7 +460,7 @@ bool InjectDataAsTcpOption(ndisapi::multi_packet_filter* ndis_api,
 
     CNdisApi::RecalculateTCPChecksum(pNewBuffer);
 	CNdisApi::RecalculateIPChecksum(pNewBuffer);
-
+    
     // 13. 重新计算校验和
     // new_ip_header->ip_sum = 0;
     // new_ip_header->ip_sum = CalculateIPChecksum(new_ip_header);
@@ -430,7 +499,7 @@ bool InjectDataAsTcpOption(ndisapi::multi_packet_filter* ndis_api,
 	// CNdisApi::RecalculateIPChecksum(pBuffer);
     
     // 15. 写入日志
-    wirteBuffer(*pNewBuffer);
+    //wirteBuffer(*pNewBuffer);
     
     // 16. 发送修改后的数据包
     ETH_REQUEST request = {0};
@@ -441,7 +510,7 @@ bool InjectDataAsTcpOption(ndisapi::multi_packet_filter* ndis_api,
     //     ndis_api->SendPacketToAdapter(&request);
     // }
     // bool bSuccess = true;
-
+    
     //bool bSuccess = ndis_api->SendPacketToAdapter(&request);
 
     auto request_ptr = std::make_shared<ETH_REQUEST>(request);
@@ -451,15 +520,15 @@ bool InjectDataAsTcpOption(ndisapi::multi_packet_filter* ndis_api,
 
     bool bSuccess = true; // 不关心是否发送成功
     
-    if (bSuccess) {
-        logFile << "=== Successfully injected " << INJECTION_DATA_SIZE << " bytes as TCP option ===" << std::endl;
-        logFile << "Custom option kind: " << static_cast<int>(TCPOPT_CUSTOM) << std::endl;
-        logFile << "Injection position: " << usedOptionSpace << std::endl;
-        logFile << "Total option length added: " << totalSpaceRequired << " bytes (data + padding)" << std::endl;
-    } else {
-        logFile << "[error] Failed to send packet with TCP option !!!" << std::endl;
-        logFile << "[error] Error code: " << GetLastError() << std::endl;
-    }
+    // if (bSuccess) {
+    //     logFile << "=== Successfully injected " << INJECTION_DATA_SIZE << " bytes as TCP option ===" << std::endl;
+    //     logFile << "Custom option kind: " << static_cast<int>(TCPOPT_CUSTOM) << std::endl;
+    //     logFile << "Injection position: " << usedOptionSpace << std::endl;
+    //     logFile << "Total option length added: " << totalSpaceRequired << " bytes (data + padding)" << std::endl;
+    // } else {
+    //     logFile << "[error] Failed to send packet with TCP option !!!" << std::endl;
+    //     logFile << "[error] Error code: " << GetLastError() << std::endl;
+    // }
     
     return bSuccess;
 }
@@ -490,12 +559,6 @@ bool InjectDataAsTcpOptionForV6(ndisapi::multi_packet_filter* ndis_api,
         logFile << "[error] Not enough space in TCP options !!!" << std::endl;
         logFile << "[error] Available: " << availableSpace << ", Needed: " << totalSpaceRequired << " (data + padding)" << std::endl;
         
-        // 提供解决方案建议
-        if (availableSpace >= 4) {
-            logFile << "[error] Suggestion: Reduce injection data to " << (availableSpace - 2 - paddingNeeded) << " bytes" << std::endl;
-        } else {
-            logFile << "[error] Suggestion: Remove some existing TCP options to free up space" << std::endl;
-        }
         return false;
     }
     
@@ -574,7 +637,7 @@ bool InjectDataAsTcpOptionForV6(ndisapi::multi_packet_filter* ndis_api,
     // IPv6没有头部校验和，所以不需要计算IP校验和
     
     // 14. 写入日志
-    wirteBuffer(*pNewBuffer);
+    //wirteBuffer(*pNewBuffer);
     
     // 15. 发送修改后的数据包
     ETH_REQUEST request = {0};
@@ -588,16 +651,16 @@ bool InjectDataAsTcpOptionForV6(ndisapi::multi_packet_filter* ndis_api,
 
     bool bSuccess = true; // 不关心是否发送成功
     
-    if (bSuccess) {
-        logFile << "=== Successfully injected " << INJECTION_DATA_SIZE << " bytes as TCP option (IPv6) ===" << std::endl;
-        logFile << "Custom option kind: " << static_cast<int>(TCPOPT_CUSTOM) << std::endl;
-        logFile << "Injection position: " << usedOptionSpace << std::endl;
-        logFile << "Total option length added: " << totalSpaceRequired << " bytes (data + padding)" << std::endl;
-        logFile << "IPv6 payload length: " << newPayloadLength << std::endl;
-    } else {
-        logFile << "[error] Failed to send IPv6 packet with TCP option !!!" << std::endl;
-        logFile << "[error] Error code: " << GetLastError() << std::endl;
-    }
+    // if (bSuccess) {
+    //     logFile << "=== Successfully injected " << INJECTION_DATA_SIZE << " bytes as TCP option (IPv6) ===" << std::endl;
+    //     logFile << "Custom option kind: " << static_cast<int>(TCPOPT_CUSTOM) << std::endl;
+    //     logFile << "Injection position: " << usedOptionSpace << std::endl;
+    //     logFile << "Total option length added: " << totalSpaceRequired << " bytes (data + padding)" << std::endl;
+    //     logFile << "IPv6 payload length: " << newPayloadLength << std::endl;
+    // } else {
+    //     logFile << "[error] Failed to send IPv6 packet with TCP option !!!" << std::endl;
+    //     logFile << "[error] Error code: " << GetLastError() << std::endl;
+    // }
     
     return bSuccess;
 }
@@ -843,30 +906,6 @@ SERVICE_TABLE_ENTRY ServiceTable[] = {
     { NULL, NULL }
 };
 
-int Log(std::string text, size_t type) {
-    logFile = std::ofstream("log.txt", std::ios::app);
-    if (!logFile.is_open()) {
-		std::cerr << "Failed to open log file." << std::endl;
-		return 0;
-	}
-    switch(type) {
-        case 1: //info
-	        logFile << "[Info] " << text << std::endl;
-            break;
-        case 3: //warning
-	        logFile << "[Warning] " << text << std::endl;
-            break;
-        case 4: //error
-	        logFile << "[Error] " << text << std::endl;
-            break;
-        default:
-	        logFile << "[Info] " << text << std::endl;
-            break;
-    }
-    logFile.close();
-    return 1;
-}
-
 //=========================入站处理函数=========================
 bool parse_tcp_option_253(const uint8_t* tcp_options, int options_len, 
                           std::vector<uint8_t>& found_value) {
@@ -900,7 +939,7 @@ bool parse_tcp_option_253(const uint8_t* tcp_options, int options_len,
         }
         
         // 检查是否为类型253
-        if (kind == 253) {  // 253是IANA保留的实验选项
+        if (kind == TCPOPT_USER) {  // 253是IANA保留的实验选项
             int value_len = length - 2;  // 减去kind和length
             if (value_len > 0) {
                 found_value.assign(ptr + 2, ptr + length);
@@ -921,6 +960,74 @@ bool check_against_preset(const std::vector<uint8_t>& found_value) {
                   found_value.size()) == 0;
 }
 //=========================================================================
+
+std::string WStringToUTF8(const std::wstring& wstr) {
+    if (wstr.empty()) return "";
+    int len = WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    std::string result(len - 1, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), -1, &result[0], len, nullptr, nullptr);
+    return result;
+}
+
+std::wstring Utf8ToWide(const std::string& utf8Str) {
+    if (utf8Str.empty()) return std::wstring();
+
+    // 1. 计算转换后所需的宽字符长度（含终止符）
+    int wideLen = MultiByteToWideChar(CP_UTF8,          // 源编码：UTF-8
+                                      0,                // 标志
+                                      utf8Str.c_str(),  // 源字符串
+                                      (int)utf8Str.size(), // 源长度
+                                      nullptr,          // 输出缓冲区为 null，仅计算长度
+                                      0);
+    if (wideLen == 0) {
+        // 转换失败处理
+        return std::wstring();
+    }
+
+    // 2. 分配目标字符串空间
+    std::wstring wideStr(wideLen, 0);
+
+    // 3. 正式转换
+    MultiByteToWideChar(CP_UTF8,
+                        0,
+                        utf8Str.c_str(),
+                        (int)utf8Str.size(),
+                        &wideStr[0],  // C++17 起 &wideStr[0] 安全，C++11 可用 data()
+                        wideLen);
+
+    return wideStr;
+}
+
+void printToken(const TokenMsg& token, const char* desc) {
+    std::cout << desc << ": nonce=0x" << std::hex << token.nonce
+            << ", token_idx=0x" << token.token_idx
+            << ", tag=";
+    for (int i = 0; i < 12; ++i) {
+        std::cout << std::setw(2) << std::setfill('0') << std::hex << (int)token.tag[i];
+    }
+    std::cout << std::dec << std::endl;
+}
+
+std::vector<uint8_t> hex_string_to_bytes(const std::string& hex) {
+    std::vector<uint8_t> bytes;
+    std::string cleaned;
+    // 移除空格、换行等分隔符
+    for (char c : hex) {
+        if (std::isxdigit(c)) {
+            cleaned.push_back(c);
+        }
+    }
+    // 长度必须为偶数
+    if (cleaned.length() % 2 != 0) {
+        return bytes; // 或 throw
+    }
+    for (size_t i = 0; i < cleaned.length(); i += 2) {
+        std::string byte_str = cleaned.substr(i, 2);
+        uint8_t byte = static_cast<uint8_t>(std::stoul(byte_str, nullptr, 16));
+        bytes.push_back(byte);
+    }
+    return bytes;
+}
 
 int main(int argc, char* argv[]) {
 	size_t TARGET_INDEX = 0;
@@ -955,6 +1062,7 @@ int main(int argc, char* argv[]) {
 			} else if (arg == "stop") {
 				return 0;
 			} else if (arg == "restart") {
+                ServiceHelper::RestartService();
 				return 0;
 			} else if (arg == "-i") {
 				if (i+1 < argc) {
@@ -965,13 +1073,18 @@ int main(int argc, char* argv[]) {
 	// }else{
     }
     std::string fileName;
-    std::string pcapName;
+    //std::string pcapName;
+    std::string exePath = getExeDir();
+
+    std::string crashPath = getExeDir() + "data\\crashpad\\agentCrash";
+    CrashHandler::Install(Utf8ToWide(crashPath));
+
     if (TARGET_INDEX == 0) {
-        fileName = "log.txt";
-        pcapName = "syn.pcap";
+        fileName = exePath + "log.txt";
+        //pcapName = "syn.pcap";
     }else{
         fileName = "log" + std::to_string(TARGET_INDEX) + ".txt";
-        pcapName = "syn" + std::to_string(TARGET_INDEX) + ".pcap";
+        //pcapName = "syn" + std::to_string(TARGET_INDEX) + ".pcap";
     }
     
     logFile = std::ofstream(fileName, std::ios::app);
@@ -981,96 +1094,116 @@ int main(int argc, char* argv[]) {
 	}
 	logFile << "Main run now" << std::endl;
 
-	//if(!ServiceHelper::IsServiceRunning()){
-	if(!logFile.is_open()){ //开发阶段屏蔽服务模式
+    const char *NAME_SPACE = "agentLog";
+    std::string logPath = exePath + "app.log";
+    AsyncJsonLogger::init(logPath.c_str(), NAME_SPACE);
+
+	if(!ServiceHelper::IsServiceRunning()){
+	//if(!logFile.is_open()){ //开发阶段屏蔽服务模式
 		if (!StartServiceCtrlDispatcher(ServiceTable)) {
 			DWORD error = GetLastError();
-			std::cout << "StartServiceCtrlDispatcher failed, error: " << error << std::endl;
+			// logFile << "StartServiceCtrlDispatcher failed, error: " << error << std::endl;
+            // logFile.close();
+            return 0;
 		}
 	}else{
 
 
 //==============================主程序 - 开始======================================
 try {
-        file_stream = pcap::pcap_file_storage();
-        file_stream.open(pcapName);
+        // file_stream = pcap::pcap_file_storage();
+        // file_stream.open(pcapName);
 
 //======================================加载配置=========================================  
 ConfigManager configManager;
 
 // 加载配置文件
 std::cout << "loading tactic file..." << std::endl;
-if (!configManager.loadConfig("tactics.json")) {
-    std::cerr << "error in loading tactic file" << std::endl;
-    return 1;
-}
+std::string configPath = exePath + "tactics.json";
+configManager.loadConfig(configPath);
+// while (true) {
+//     if (configManager.loadConfig("tactics.json")) {
+//         std::cout << "tactic file loaded successfully" << std::endl;
+//         break;
+//     }
+//     // 等待5秒后再次检查
+//     std::this_thread::sleep_for(std::chrono::seconds(5));
+// }
 
 // 打印统计信息
-std::cout << "tactic print status:" << std::endl;
-configManager.printStats();
+// std::cout << "tactic print status:" << std::endl;
+// configManager.printStats();
 
-// 1. 验证SHA256查询的正确性
-std::cout << "1. SHA256 query test:" << std::endl;
-std::string sha2561 = "D4C7D3E2F1A4B5C6D7E8F9A0B1C2D3E4E5F6A7B8C9D0E1F2A3B4C5D6E7F8G9H0";
-std::string sha2562 = "A1B2C3D4E5F6G7H8I9J0K1L2M3N4O5P6Q7R8S9T0U1V2W3X4Y5Z6A7B8C9D0E1";
+// // 1. 验证SHA256查询的正确性
+// std::cout << "1. SHA256 query test:" << std::endl;
+// std::string sha2561 = "D4C7D3E2F1A4B5C6D7E8F9A0B1C2D3E4E5F6A7B8C9D0E1F2A3B4C5D6E7F8G9H0";
+// std::string sha2562 = "A1B2C3D4E5F6G7H8I9J0K1L2M3N4O5P6Q7R8S9T0U1V2W3X4Y5Z6A7B8C9D0E1";
 
-if (auto process = configManager.getProcessBySha256(sha2561)) {
-    std::cout << "  Found SHA256 " << sha2561.substr(0, 16) << "... eque process: " 
-                << process->name << " v" << process->path << std::endl;
-}
+// if (auto process = configManager.getProcessBySha256(sha2561)) {
+//     std::cout << "  Found SHA256 " << sha2561.substr(0, 16) << "... eque process: " 
+//                 << process->name << " v" << process->path << std::endl;
+// }
 
-if (auto process = configManager.getProcessBySha256(sha2562)) {
-    std::cout << "  Found SHA256 " << sha2562.substr(0, 16) << "... eque process: " 
-                << process->name << " v" << process->path << std::endl;
-}
+// if (auto process = configManager.getProcessBySha256(sha2562)) {
+//     std::cout << "  Found SHA256 " << sha2562.substr(0, 16) << "... eque process: " 
+//                 << process->name << " v" << process->path << std::endl;
+// }
 
-// 2. 测试同名进程查询
-std::cout << "2. test query process(es) while has the same name:" << std::endl;
-auto chromeProcesses = configManager.getAllProcessesByName("chrome.exe");
-std::cout << "  Found " << chromeProcesses.size() << " process(es) named chrome.exe" << std::endl;
-for (const auto& proc : chromeProcesses) {
-    std::cout << "    - version: " << proc.path 
-                << ", SHA256: " << proc.sha256.substr(0, 16) << "..." << std::endl;
-}
+// // 2. 测试同名进程查询
+// std::cout << "2. test query process(es) while has the same name:" << std::endl;
+// auto chromeProcesses = configManager.getAllProcessesByName("chrome.exe");
+// std::cout << "  Found " << chromeProcesses.size() << " process(es) named chrome.exe" << std::endl;
+// for (const auto& proc : chromeProcesses) {
+//     std::cout << "    - version: " << proc.path 
+//                 << ", SHA256: " << proc.sha256.substr(0, 16) << "..." << std::endl;
+// }
 
-// 3. 测试复合键查询
-std::cout << "3. query by addr and port:" << std::endl;
-if (auto filter = configManager.getFilterByAddrAndPort("192.168.31.71", 80)) {
-    std::cout << "  find the filter: " << filter->addr << ":" << filter->port << std::endl;
-    std::cout << "    allow process: ";
-    for (const auto& proc : filter->allow_processes) {
-        std::cout << proc.name << " ";
-    }
-    std::cout << std::endl;
-}
+// // 3. 测试复合键查询
+// std::cout << "3. query by addr and port:" << std::endl;
+// if (auto filter = configManager.getFilterByAddrAndPort("192.168.31.71", 80)) {
+//     std::cout << "  find the filter: " << filter->addr << ":" << filter->port << std::endl;
+//     std::cout << "    allow process: ";
+//     for (const auto& proc : filter->allow_processes) {
+//         std::cout << proc.name << " ";
+//     }
+//     std::cout << std::endl;
+// }
 
-if (auto filter = configManager.getFilterByAddrAndPort("192.168.56.102", 80)) {
-    std::cout << "  find the filter: " << filter->addr << ":" << filter->port << std::endl;
-} else {
-    std::cout << "  unable to find 192.168.31.71:30080 's filter" << std::endl;
-}
+// if (auto filter = configManager.getFilterByAddrAndPort("192.168.56.102", 80)) {
+//     std::cout << "  find the filter: " << filter->addr << ":" << filter->port << std::endl;
+// } else {
+//     std::cout << "  unable to find 192.168.31.71:30080 's filter" << std::endl;
+// }
 
-// 4. 测试按地址批量查询
-std::cout << "4. query by addr:" << std::endl;
-auto filters = configManager.getFiltersByAddr("192.168.56.102");
-std::cout << "  Found " << filters.size() << " of 192.168.56.102 's filter':" << std::endl;
-for (const auto& filter : filters) {
-    std::cout << "    - prot: " << filter.port 
-                << ", rules: " << filter.tokens.size() 
-                << ", process: " << filter.allow_processes.size() << std::endl;
-}
+// // 4. 测试按地址批量查询
+// std::cout << "4. query by addr:" << std::endl;
+// auto filters = configManager.getFiltersByAddr("192.168.56.102");
+// std::cout << "  Found " << filters.size() << " of 192.168.56.102 's filter':" << std::endl;
+// for (const auto& filter : filters) {
+//     std::cout << "    - prot: " << filter.port 
+//                 << ", rules: " << filter.tokens.size() 
+//                 << ", process: " << filter.allow_processes.size() << std::endl;
+// }
 
-// 5. 访问权限测试
-std::cout << "5. enter test:" << std::endl;
-std::cout << "  check chrome.exe by  SHA256: "
-            << (configManager.canProcessAccessBySha256(sha2561, "192.168.31.71", 80) ? "✓ allow" : "✗ deny") << std::endl;
+// // 4.5.... 按照端口查询
+// std::cout << "4. query by port:" << std::endl;
+// auto service = configManager.getServiceByPort(3389);
+// if(service){
+//     std::cout << "  Found service addr: " << service->addr << std::endl;
+//     std::cout << "  Found service port: " << service->port << std::endl;
+// }
 
-// 6. 配置信息获取
-std::cout << "6. config status:" << std::endl;
-std::cout << "  global: " << configManager.getGlobalType() << std::endl;
-std::cout << "  global filter: " << (configManager.getGlobalFilter() ? "on" : "off") << std::endl;
-std::cout << "  process filter: " << (configManager.getProcessFilter() ? "on" : "off") << std::endl;
-std::cout << "  handshake filter: " << (configManager.getHandshakeFilter() ? "on" : "off") << std::endl;
+// // 5. 访问权限测试
+// std::cout << "5. enter test:" << std::endl;
+// std::cout << "  check chrome.exe by  SHA256: "
+//             << (configManager.canProcessAccessBySha256(sha2561, "192.168.31.71", 80) ? "✓ allow" : "✗ deny") << std::endl;
+
+// // 6. 配置信息获取
+// std::cout << "6. config status:" << std::endl;
+// std::cout << "  global: " << configManager.getGlobalType() << std::endl;
+// std::cout << "  global filter: " << (configManager.getGlobalFilter() ? "on" : "off") << std::endl;
+// std::cout << "  process filter: " << (configManager.getProcessFilter() ? "on" : "off") << std::endl;
+// std::cout << "  handshake filter: " << (configManager.getHandshakeFilter() ? "on" : "off") << std::endl;
 
 //======================================加载配置=========================================
 
@@ -1079,11 +1212,18 @@ std::cout << "  handshake filter: " << (configManager.getHandshakeFilter() ? "on
 
         std::unique_ptr<ndisapi::multi_packet_filter> ndis_api;
         //std::vector<std::string> allow_sports;
-        
+
+        std::string masterSecret = "linuxTest123456";
+        AesGcmTokenCrypto crypto(masterSecret);
+
+        ExtProtection extProtection;
+
         // 初始化 NDIS API
         ndis_api = std::make_unique<ndisapi::multi_packet_filter>(
-            [&configManager](HANDLE adapter, INTERMEDIATE_BUFFER& buffer) {
-                // 入站数据包处理
+            [&configManager, &crypto, &extProtection](HANDLE adapter, INTERMEDIATE_BUFFER& buffer) {
+                if (!extProtection.checkPacket(buffer, true, adapter)) {
+                    return ndisapi::multi_packet_filter::packet_action::drop;
+                }
                 if (auto* const ether_header = reinterpret_cast<ether_header_ptr>(buffer.m_IBuffer); 
                     ntohs(ether_header->h_proto) == ETH_P_IP) {
                     if (auto* const ip_header = reinterpret_cast<iphdr_ptr>(ether_header + 1); 
@@ -1100,12 +1240,20 @@ std::cout << "  handshake filter: " << (configManager.getHandshakeFilter() ? "on
                             //     return ndisapi::multi_packet_filter::packet_action::pass;
                             // }
                             
-
-                            u_char tcpPort = tcp_header->th_dport;
-                            //logFile << "=== Incoming TCP Destination Port: " << static_cast<int>(tcpPort) << " ===" << std::endl;
-
+                            //std::cout << "=== Incoming TCP SYN, Port: " << ntohs(tcp_header->th_dport) << " ===" << std::endl;
+                            //logFile << "=== Incoming TCP Destination Port: " << ntohs(tcpPort) << " ===" << std::endl;
+                            
                             auto res = configManager.getServiceByPort(ntohs(tcp_header->th_dport));
                             if(!res.has_value()){
+                                return ndisapi::multi_packet_filter::packet_action::pass;
+                            }
+                            char ip_str[INET_ADDRSTRLEN];   // 足够容纳 IPv4 字符串
+                            inet_ntop(AF_INET, &ip_header->ip_src, ip_str, sizeof(ip_str));
+                            char portStr[6];  // 端口最大 65535，占 5 个字符 + 终止符
+                            uint16_t srcPort = ntohs(tcp_header->th_sport);
+                            snprintf(portStr, sizeof(portStr), "%u", srcPort);
+                            if(configManager.isIpAllow(ip_str, ntohs(tcp_header->th_dport))){
+                                LOG_EVENT("SYN-IN", "allowed", "", std::string(ip_str).c_str(), portStr, "", "", "", "");
                                 return ndisapi::multi_packet_filter::packet_action::pass;
                             }
 
@@ -1115,6 +1263,7 @@ std::cout << "  handshake filter: " << (configManager.getHandshakeFilter() ? "on
                             if (tcpHeaderLength <= sizeof(struct tcphdr)) {
                                 return ndisapi::multi_packet_filter::packet_action::drop;
                             }
+                            std::cout << "TCP Header Length: " << tcpHeaderLength << " bytes" << std::endl;
                             int options_len = tcpHeaderLength - sizeof(struct tcphdr);
                             const uint8_t* options_data = reinterpret_cast<BYTE*>(tcp_header) + sizeof(struct tcphdr);
                             //BYTE* currentOptions = reinterpret_cast<BYTE*>(tcp_header) + basicTcpHeaderSize;
@@ -1124,7 +1273,43 @@ std::cout << "  handshake filter: " << (configManager.getHandshakeFilter() ? "on
                                 // if (check_against_preset(found_253_value)) {
                                 //     return ndisapi::multi_packet_filter::packet_action::pass;
                                 // }
-                                if(configManager.isTokenVerified(std::string(found_253_value.begin(), found_253_value.end()), ntohs(tcpPort))){
+                                
+                                TokenMsg options;
+                                // 1. 拷贝原始字节到结构体（此时 nonce/token_idx 仍是网络字节序）
+                                std::memcpy(&options, found_253_value.data(), sizeof(TokenMsg));
+                                // 2. 将网络字节序转为主机字节序（假设当前是小端平台）
+                                options.nonce = ntohl(options.nonce);
+                                auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                        std::chrono::system_clock::now().time_since_epoch()
+                                    ).count();
+                                uint64_t local_timestamp = static_cast<uint64_t>(ms / 1000) & 0xFFFFFFFFFFFFULL;
+                                int64_t diff = static_cast<int64_t>(local_timestamp) - static_cast<int64_t>(options.nonce);
+                                if (diff < 0) diff = -diff;
+                                if(diff > 30){ //时间戳相差超过30秒，认为是重放攻击
+                                    //std::cerr << "FAILED: Authentication failure detected (timestamp mismatch)" << std::endl;
+                                    LOG_EVENT("SYN-IN", "blocked", "", std::string(ip_str).c_str(), portStr, "", "", "", "timestamp mismatch");
+                                    return ndisapi::multi_packet_filter::packet_action::drop;
+                                }
+                                options.token_idx = ntohl(options.token_idx);
+                                //printToken(options, "Encrypted Token");
+                                if (!crypto.decrypt(options)) {
+                                    //std::cerr << "FAILED: Authentication failure detected (tag mismatch)" << std::endl;
+                                    LOG_EVENT("SYN-IN", "blocked", "", std::string(ip_str).c_str(), portStr, "", "", "", "decrypt failed");
+                                    return ndisapi::multi_packet_filter::packet_action::drop;
+                                }
+                                std::stringstream ss;
+                                ss << std::hex << options.token_idx;
+                                std::string token = ss.str();
+                                
+                                //std::cout << "Token String: " << token << std::endl;
+                                if(configManager.isTokenVerified(token, ntohs(tcp_header->th_dport))){
+                                    // std::cout << "income data:" << std::endl;
+                                    // for (int i = 10; i < 16; i++) {
+                                    //     std::cout << "data[" << i << "] = 0x" << std::hex << std::setw(2) 
+                                    //             << std::setfill('0') << (int)found_253_value[i] << std::dec;
+                                    //     if (i < 15) std::cout << ", ";
+                                    // }
+                                    // std::cout << std::endl;
                                     return ndisapi::multi_packet_filter::packet_action::pass;
                                 }
                             }
@@ -1150,6 +1335,16 @@ std::cout << "  handshake filter: " << (configManager.getHandshakeFilter() ? "on
                                 return ndisapi::multi_packet_filter::packet_action::pass;
                             }
 
+                            char ip_str[INET6_ADDRSTRLEN];  // 注意是 INET6_ADDRSTRLEN
+                            inet_ntop(AF_INET6, &ip_header->ip6_src, ip_str, INET6_ADDRSTRLEN);
+                            char portStr[6];  // 端口最大 65535，占 5 个字符 + 终止符
+                            uint16_t srcPort = ntohs(tcp_header->th_sport);
+                            snprintf(portStr, sizeof(portStr), "%u", srcPort);
+                            if(configManager.isIpAllow(ip_str, ntohs(tcp_header->th_dport))){
+                                LOG_EVENT("SYN-IN", "allowed", "", std::string(ip_str).c_str(), portStr, "", "", "", "");
+                                return ndisapi::multi_packet_filter::packet_action::pass;
+                            }
+
                             DWORD tcpHeaderLength = (tcp_header->th_off) * 4;
                             DWORD basicTcpHeaderSize = 20;
                             if (tcpHeaderLength <= sizeof(struct tcphdr)) {
@@ -1164,7 +1359,42 @@ std::cout << "  handshake filter: " << (configManager.getHandshakeFilter() ? "on
                                 // if (check_against_preset(found_253_value)) {
                                 //     return ndisapi::multi_packet_filter::packet_action::pass;
                                 // }
-                                if(configManager.isTokenVerified(std::string(found_253_value.begin(), found_253_value.end()), ntohs(tcp_header->th_dport))){
+                                TokenMsg options;
+                                // 1. 拷贝原始字节到结构体（此时 nonce/token_idx 仍是网络字节序）
+                                std::memcpy(&options, found_253_value.data(), sizeof(TokenMsg));
+                                // 2. 将网络字节序转为主机字节序（假设当前是小端平台）
+                                options.nonce = ntohl(options.nonce);
+                                auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                        std::chrono::system_clock::now().time_since_epoch()
+                                    ).count();
+                                uint64_t local_timestamp = static_cast<uint64_t>(ms / 1000) & 0xFFFFFFFFFFFFULL;
+                                int64_t diff = static_cast<int64_t>(local_timestamp) - static_cast<int64_t>(options.nonce);
+                                if (diff < 0) diff = -diff;
+                                if(diff > 30){ //时间戳相差超过30秒，认为是重放攻击
+                                    //std::cerr << "FAILED: Authentication failure detected (timestamp mismatch)" << std::endl;
+                                    LOG_EVENT("SYN-IN", "blocked", "", std::string(ip_str).c_str(), portStr, "", "", "", "timestamp mismatch");
+                                    return ndisapi::multi_packet_filter::packet_action::drop;
+                                }
+                                options.token_idx = ntohl(options.token_idx);
+                                //printToken(options, "Encrypted Token");
+                                if (!crypto.decrypt(options)) {
+                                    //std::cerr << "FAILED: Authentication failure detected (tag mismatch)" << std::endl;
+                                    LOG_EVENT("SYN-IN", "blocked", "", std::string(ip_str).c_str(), portStr, "", "", "", "decrypt failed");
+                                    return ndisapi::multi_packet_filter::packet_action::drop;
+                                }
+                                std::stringstream ss;
+                                ss << std::hex << options.token_idx;
+                                std::string token = ss.str();
+                                
+                                std::cout << "Token String: " << token << std::endl;
+                                if(configManager.isTokenVerified(token, ntohs(tcp_header->th_dport))){
+                                    // std::cout << "income data:" << std::endl;
+                                    // for (int i = 10; i < 16; i++) {
+                                    //     std::cout << "data[" << i << "] = 0x" << std::hex << std::setw(2) 
+                                    //             << std::setfill('0') << (int)found_253_value[i] << std::dec;
+                                    //     if (i < 15) std::cout << ", ";
+                                    // }
+                                    // std::cout << std::endl;
                                     return ndisapi::multi_packet_filter::packet_action::pass;
                                 }
                             }
@@ -1174,7 +1404,10 @@ std::cout << "  handshake filter: " << (configManager.getHandshakeFilter() ? "on
 				}
                 return ndisapi::multi_packet_filter::packet_action::pass;
             },
-            [&ndis_api, &configManager](HANDLE adapterHandle, INTERMEDIATE_BUFFER& buffer) {
+            [&ndis_api, &configManager, &crypto, &extProtection](HANDLE adapterHandle, INTERMEDIATE_BUFFER& buffer) {
+                if (!extProtection.checkPacket(buffer, false, adapterHandle)) {
+                    return ndisapi::multi_packet_filter::packet_action::drop;
+                }
                 // 出站数据包处理
                 if (auto* const ether_header = reinterpret_cast<ether_header_ptr>(buffer.m_IBuffer); 
                     ntohs(ether_header->h_proto) == ETH_P_IP) { // 处理IPv4
@@ -1213,7 +1446,8 @@ std::cout << "  handshake filter: " << (configManager.getHandshakeFilter() ? "on
                             // << static_cast<int>(addr.S_un.S_un_b.s_b1) << "."
                             // << static_cast<int>(addr.S_un.S_un_b.s_b2) << "."
                             // << static_cast<int>(addr.S_un.S_un_b.s_b3) << "."
-                            // << static_cast<int>(addr.S_un.S_un_b.s_b4)
+                            // << static_cast<int>(addr.S_un.S_un_b.s_b4) << ":" 
+                            // << ntohs(tcp_header->th_dport)
                             // << "]" << std::endl;
 
                                                     
@@ -1238,7 +1472,7 @@ std::cout << "  handshake filter: " << (configManager.getHandshakeFilter() ? "on
                             auto WproStr = process->name;
                             std::string proStr = std::string(WproStr.begin(), WproStr.end());
                             auto sha256 = Sha256Helper::CalculateFileSHA256(process_path);
-                            logFile << "Process: " << proStr << " Path: " << std::string(process_path.begin(), process_path.end()) << std::endl;
+                            //logFile << "Process: " << proStr << " Path: " << std::string(process_path.begin(), process_path.end()) << std::endl;
                             // logFile << "ProcessId: " << static_cast<int>(process_id) << std::endl;
                             //logFile << "SHA256: " << sha256 << std::endl;
 //=======================test process get==========================
@@ -1262,21 +1496,30 @@ std::cout << "  handshake filter: " << (configManager.getHandshakeFilter() ? "on
                             char ip_str[INET_ADDRSTRLEN];
                             const char* result = inet_ntop(AF_INET, &addr, ip_str, INET_ADDRSTRLEN);
                             if(result == nullptr){
-                                logFile << "  error addr" << std::endl;
+                                //logFile << "  error addr" << std::endl;
                                 return ndisapi::multi_packet_filter::packet_action::pass;
                             }
+                            uint16_t dstPort = ntohs(tcp_header->th_dport);
+                            char portStr[6];  // 端口最大 65535，占 5 个字符 + 终止符
+                            snprintf(portStr, sizeof(portStr), "%u", dstPort);
                             auto filter = configManager.getFilterByAddrAndPort(std::string(ip_str), ntohs(tcp_header->th_dport));
                             if (filter) {
-                                logFile << "  find the filter: " << filter->addr << ":" << filter->port << std::endl;
+                                //logFile << "  find the filter: " << filter->addr << ":" << filter->port << std::endl;
+                                if(filter->blocked){
+                                    LOG_EVENT("SYN-OUT", "blocked", std::string(filter->id).c_str(), std::string(ip_str).c_str(), portStr, configManager.getIdentityId().c_str(), configManager.getIdentityName().c_str(), "windows", WStringToUTF8(process_path).c_str());
+                                    //return ndisapi::multi_packet_filter::packet_action::drop;
+                                }
                                 if(!filter->allow_processes.empty()){
                                     if(!configManager.canProcessAccess(processEntry, std::string(ip_str), ntohs(tcp_header->th_dport))){
-                                        logFile << "blocked process: " << proStr << ", for " << std::string(ip_str) << ":" << ntohs(tcp_header->th_dport) << std::endl;
+                                        //logFile << "blocked process: " << proStr << ", for " << std::string(ip_str) << ":" << ntohs(tcp_header->th_dport) << std::endl;
+                                        LOG_EVENT("PROCESS", "blocked", std::string(filter->id).c_str(), std::string(ip_str).c_str(), portStr, configManager.getIdentityId().c_str(), configManager.getIdentityName().c_str(), "windows", WStringToUTF8(process_path).c_str());
                                         return ndisapi::multi_packet_filter::packet_action::drop;
                                     }
                                 }
                             } else {
-                                if(!configManager.canProcessLinkNetwork(processEntry)){
-                                    logFile << "blocked process: " << proStr << ", for Network" << std::endl;
+                                if(configManager.getProcessFilter() && !configManager.canProcessLinkNetwork(processEntry)){
+                                    //logFile << "blocked process: " << proStr << ", for Network" << std::endl;
+                                    //LOG_EVENT("PROCESS", "blocked", "", std::string(ip_str).c_str(), portStr, configManager.getIdentityId().c_str(), configManager.getIdentityName().c_str(), "windows", WStringToUTF8(process_path).c_str());
                                     return ndisapi::multi_packet_filter::packet_action::drop;
                                 }else{
                                     return ndisapi::multi_packet_filter::packet_action::pass;
@@ -1288,23 +1531,35 @@ std::cout << "  handshake filter: " << (configManager.getHandshakeFilter() ? "on
                             //     //file_stream << buffer;
                             //     return ndisapi::multi_packet_filter::packet_action::pass;
                             // }
-
-                            // 使用TCP选项方式注入数据
-                            BYTE injection_data; // 16字节数据
-                            auto timestamp = std::chrono::duration_cast<std::chrono::seconds>(
+                            
+                            auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                 std::chrono::system_clock::now().time_since_epoch()
                             ).count();
-                            // 截取后6位
-                            int last_6_digits = timestamp % 1000000;
-                            std::string last_6_str = last_6_digits>100000 ? std::to_string(last_6_digits):std::string("0") + std::to_string(last_6_digits);
-                            std::string pre_inject_str = filter->tokens[0] + last_6_str + last_6_str;
-                            logFile << "=== inject data: "<< pre_inject_str << std::endl;
-                            std::vector<BYTE> byteArray = hexStringToBytes(pre_inject_str);
-                            const BYTE* correctPtr = byteArray.data();
-                            std::cout << "正确字节数据: ";
-                            for (size_t i = 0; i < byteArray.size(); i++) {
-                                printf("%02X ", correctPtr[i]);
+                            uint64_t timestamp = static_cast<uint64_t>(ms / 1000) & 0xFFFFFFFFFFFFULL;
+
+                            TokenMsg token = {0};
+                            token.nonce = static_cast<uint32_t>(timestamp);
+                            token.token_idx = static_cast<uint32_t>(std::stoul(filter->tokens[0], nullptr, 16));
+                            
+                            if (!crypto.encrypt(token)) {
+                                std::cerr << "Encryption failed" << std::endl;
+                                return ndisapi::multi_packet_filter::packet_action::drop;
                             }
+                            //printToken(token, "Encrypted Token");
+                            token.nonce = htonl(token.nonce);
+                            token.token_idx = htonl(token.token_idx);
+
+                            std::vector<BYTE> injection_data;// 20字节
+                            injection_data.resize(sizeof(token));
+                            std::memcpy(injection_data.data(), &token, sizeof(token));
+
+                            const BYTE* correctPtr = injection_data.data();
+
+                            // std::cout << "[inject_data]: ";
+                            // for (size_t i = 0; i < injection_data.size(); i++) {
+                            //     printf("%02X ", correctPtr[i]);
+                            // }
+                            // std::cout << "\n";
                             
                             if (InjectDataAsTcpOption(ndis_api.get(), adapterHandle, &buffer, ip_header, tcp_header, correctPtr)) {
                                 //logFile << "=== TCP option injection successful, dropping original ===" << std::endl;
@@ -1335,7 +1590,7 @@ std::cout << "  handshake filter: " << (configManager.getHandshakeFilter() ? "on
 
                         // 检查SYN包
                         if ((tcpFlags & TH_SYN) && !(tcpFlags & TH_ACK)) {
-                            logFile << "=== Ipv6 SYN ===" << std::endl;
+                            //logFile << "=== Ipv6 SYN ===" << std::endl;
                             auto process = iphelper::process_lookup<net::ip_address_v6>::get_process_helper().
                                 lookup_process_for_tcp<false>(
                                     net::ip_session<net::ip_address_v6>(ip_header->ip6_src, ip_header->ip6_dst,
@@ -1357,7 +1612,7 @@ std::cout << "  handshake filter: " << (configManager.getHandshakeFilter() ? "on
                             auto WproStr = process->name;
                             std::string proStr = std::string(WproStr.begin(), WproStr.end());
                             auto sha256 = Sha256Helper::CalculateFileSHA256(process_path);
-                            logFile << "Process: " << proStr << " Path: " << std::string(process_path.begin(), process_path.end()) << std::endl;
+                            //logFile << "Process: " << proStr << " Path: " << std::string(process_path.begin(), process_path.end()) << std::endl;
 
                             ConfigTypes::ProcessEntry processEntry(
                                 proStr,
@@ -1369,43 +1624,63 @@ std::cout << "  handshake filter: " << (configManager.getHandshakeFilter() ? "on
                             char ip_str[INET6_ADDRSTRLEN];  // 注意是 INET6_ADDRSTRLEN
                             const char* result = inet_ntop(AF_INET6, &ip_header->ip6_dst, ip_str, INET6_ADDRSTRLEN);
                             if(result == nullptr){
-                                logFile << "  error addr" << std::endl;
+                                //logFile << "  error addr" << std::endl;
                                 return ndisapi::multi_packet_filter::packet_action::pass;
                             }
-                            logFile << "Target addr: " << std::string(ip_str) << ", Port: " << ntohs(tcp_header->th_dport) << std::endl;
+                            //logFile << "Target addr: " << std::string(ip_str) << ", Port: " << ntohs(tcp_header->th_dport) << std::endl;
+                            uint16_t dstPort = ntohs(tcp_header->th_dport);
+                            char portStr[6];  // 端口最大 65535，占 5 个字符 + 终止符
+                            snprintf(portStr, sizeof(portStr), "%u", dstPort);
                             auto filter = configManager.getFilterByAddrAndPort(std::string(ip_str), ntohs(tcp_header->th_dport));
                             if (filter) {
-                                logFile << "  find the filter: " << filter->addr << ":" << filter->port << std::endl;
+                                //logFile << "  find the filter: " << filter->addr << ":" << filter->port << std::endl;
+                                if(filter->blocked){
+                                    LOG_EVENT("SYN-OUT", "blocked", std::string(filter->id).c_str(), std::string(ip_str).c_str(), portStr, configManager.getIdentityId().c_str(), configManager.getIdentityName().c_str(), "windows", WStringToUTF8(process_path).c_str());
+                                    //return ndisapi::multi_packet_filter::packet_action::drop;
+                                }
                                 if(!filter->allow_processes.empty()){
                                     if(!configManager.canProcessAccess(processEntry, std::string(ip_str), ntohs(tcp_header->th_dport))){
-                                        logFile << "blocked process: " << proStr << ", for " << std::string(ip_str) << ":" << ntohs(tcp_header->th_dport) << std::endl;
+                                        //logFile << "blocked process: " << proStr << ", for " << std::string(ip_str) << ":" << ntohs(tcp_header->th_dport) << std::endl;
+                                        LOG_EVENT("PROCESS", "blocked", std::string(filter->id).c_str(), std::string(ip_str).c_str(), portStr, configManager.getIdentityId().c_str(), configManager.getIdentityName().c_str(), "windows", WStringToUTF8(process_path).c_str());
                                         return ndisapi::multi_packet_filter::packet_action::drop;
                                     }
                                 }
                             } else {
                                 if(!configManager.canProcessLinkNetwork(processEntry)){
-                                    logFile << "blocked process: " << proStr << ", for Network" << std::endl;
+                                    //logFile << "blocked process: " << proStr << ", for Network" << std::endl;
+                                    //LOG_EVENT("PROCESS", "blocked", "", std::string(ip_str).c_str(), portStr, configManager.getIdentityId().c_str(), configManager.getIdentityName().c_str(), "windows", WStringToUTF8(process_path).c_str());
                                     return ndisapi::multi_packet_filter::packet_action::drop;
                                 }else{
                                     return ndisapi::multi_packet_filter::packet_action::pass;
                                 }
                             }
 
-                            BYTE injection_data; // 16字节数据
-                            auto timestamp = std::chrono::duration_cast<std::chrono::seconds>(
+                            auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                 std::chrono::system_clock::now().time_since_epoch()
                             ).count();
-                            // 截取后6位
-                            int last_6_digits = timestamp % 1000000;
-                            std::string last_6_str = last_6_digits>100000 ? std::to_string(last_6_digits):std::string("0") + std::to_string(last_6_digits);
-                            std::string pre_inject_str = filter->tokens[0] + last_6_str + last_6_str;
-                            logFile << "=== inject data: "<< pre_inject_str << std::endl;
-                            std::vector<BYTE> byteArray = hexStringToBytes(pre_inject_str);
-                            const BYTE* correctPtr = byteArray.data();
-                            std::cout << "正确字节数据: ";
-                            for (size_t i = 0; i < byteArray.size(); i++) {
-                                printf("%02X ", correctPtr[i]);
+                            uint64_t timestamp = static_cast<uint64_t>(ms / 1000) & 0xFFFFFFFFFFFFULL;
+
+                            TokenMsg token = {0};
+                            token.nonce = static_cast<uint32_t>(timestamp);
+                            token.token_idx = static_cast<uint32_t>(std::stoul(filter->tokens[0], nullptr, 16));
+                            if (!crypto.encrypt(token)) {
+                                std::cerr << "Encryption failed" << std::endl;
+                                return ndisapi::multi_packet_filter::packet_action::drop;
                             }
+                            //printToken(token, "Encrypted Token");
+                            token.nonce = htonl(token.nonce);
+                            token.token_idx = htonl(token.token_idx);
+
+                            std::vector<BYTE> injection_data;// 20字节
+                            injection_data.resize(sizeof(token));
+                            std::memcpy(injection_data.data(), &token, sizeof(token));
+
+                            const BYTE* correctPtr = injection_data.data();
+
+                            // std::cout << "[inject_data]: ";
+                            // for (size_t i = 0; i < injection_data.size(); i++) {
+                            //     printf("%02X ", correctPtr[i]);
+                            // }
                             
                             if (InjectDataAsTcpOptionForV6(ndis_api.get(), adapterHandle, &buffer, ip_header, tcp_header, correctPtr)) {
                                 //logFile << "=== TCP option injection successful, dropping original ===" << std::endl;
@@ -1427,44 +1702,155 @@ std::cout << "  handshake filter: " << (configManager.getHandshakeFilter() ? "on
         }
 
 //加解密开始==============================================
-		AESCrypto crypto;
+		// AESCrypto crypto;
     
-		// 16字节密钥
-		std::vector<uint8_t> key = {0x01,0x23,0x45,0x67,0x89,0xAB,0xCD,0xEF,
-								0xFE,0xDC,0xBA,0x98,0x76,0x54,0x32,0x10};
+		// // 16字节密钥
+		// std::vector<uint8_t> key = {0x01,0x23,0x45,0x67,0x89,0xAB,0xCD,0xEF,
+		// 						0xFE,0xDC,0xBA,0x98,0x76,0x54,0x32,0x10};
 		
-		std::string dataStr = "e2hk1h5gfz093345";
-		std::vector<uint8_t> original = std::vector<uint8_t>(dataStr.begin(), dataStr.end());
-		// 16字节原始数据
-		// std::vector<uint8_t> original = {0x11,0x22,0x33,0x44,0x55,0x66,0x77,0x88,
-		// 								0x99,0xAA,0xBB,0xCC,0xDD,0xEE,0xFF,0x00};
+		// std::string dataStr = "e2hk1h5gfz093345";
+		// std::vector<uint8_t> original = std::vector<uint8_t>(dataStr.begin(), dataStr.end());
+		// // 16字节原始数据
+		// // std::vector<uint8_t> original = {0x11,0x22,0x33,0x44,0x55,0x66,0x77,0x88,
+		// // 								0x99,0xAA,0xBB,0xCC,0xDD,0xEE,0xFF,0x00};
 		
-		if (crypto.initialize(key)) {
-			// 加密：16字节 → 16字节
-			std::vector<uint8_t> encrypted = crypto.encrypt(original);
+		// if (crypto.initialize(key)) {
+		// 	// 加密：16字节 → 16字节
+		// 	std::vector<uint8_t> encrypted = crypto.encrypt(original);
 			
-			std::cout << "原始数据: ";
-			for (auto b : original) printf("%02X ", b);
-			std::cout << std::endl;
+		// 	std::cout << "原始数据: ";
+		// 	for (auto b : original) printf("%02X ", b);
+		// 	std::cout << std::endl;
 			
-			std::cout << "加密后: ";
-			for (auto b : encrypted) printf("%02X ", b);
-			std::cout << std::endl;
+		// 	std::cout << "加密后: ";
+		// 	for (auto b : encrypted) printf("%02X ", b);
+		// 	std::cout << std::endl;
 			
-			// 这里可以将encrypted注入到TCP选项中
+		// 	// 这里可以将encrypted注入到TCP选项中
 			
-			// 解密：16字节 → 16字节
-			std::vector<uint8_t> decrypted = crypto.decrypt(encrypted);
+		// 	// 解密：16字节 → 16字节
+		// 	std::vector<uint8_t> decrypted = crypto.decrypt(encrypted);
 			
-			std::cout << "解密后: ";
-			for (auto b : decrypted) printf("%02X ", b);
-			std::cout << std::endl;
+		// 	std::cout << "解密后: ";
+		// 	for (auto b : decrypted) printf("%02X ", b);
+		// 	std::cout << std::endl;
 			
-			// 验证
-			if (original == decrypted) {
-				std::cout << "✓ 加解密成功！16字节 ↔ 16字节" << std::endl;
-			}
-		}
+		// 	// 验证
+		// 	if (original == decrypted) {
+		// 		std::cout << "✓ 加解密成功！16字节 ↔ 16字节" << std::endl;
+		// 	}
+		// }
+
+    //std::string masterSecret = "MySuperSecretKeyForTest";
+    // const int testMaxCnt = 3;
+    // const bool testDecryptFail = true;
+
+    // //AesGcmTokenCrypto crypto(masterSecret);
+    // std::cout << "=== AES-GCM Test Started ===" << std::endl;
+
+    // std::random_device rd;
+    // std::mt19937 gen(rd());
+    // std::uniform_int_distribution<uint32_t> distU32;
+
+    // auto totalStart = std::chrono::system_clock::now();
+    // long long totalMakeDataTime = 0;
+
+    // for (int i = 0; i < testMaxCnt; ++i) {
+    //     std::cout << "\n--- Test iteration " << i + 1 << " ---" << std::endl;
+
+    //     TokenMsg token = {0};
+    //     auto makeStart = std::chrono::system_clock::now();
+    //     token.nonce = distU32(gen);
+    //     token.token_idx = distU32(gen);
+    //     uint32_t originalTokenIdx = token.token_idx;
+    //     totalMakeDataTime += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now() - makeStart).count();
+
+    //     printToken(token, "Original");
+
+    //     // 加密
+    //     std::cout << "Encrypting..." << std::endl;
+    //     auto encStart = std::chrono::system_clock::now();
+    //     if (!crypto.encrypt(token)) {
+    //         std::cerr << "Encryption failed" << std::endl;
+    //         return -1;
+    //     }
+    //     auto encElapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now() - encStart).count();
+    //     std::cout << "Encrypt elapsed time: " << encElapsed << " ns" << std::endl;
+    //     printToken(token, "Encrypted");
+
+    //     TokenMsg token2 = {
+    //         0x89e1d433,  // nonce
+    //         0x946538ef,  // token_idx
+    //         {0x08, 0xD1, 0x43, 0x3E, 0x00, 0x20, 0xD9, 0xD5, 0x9A, 0xF8, 0x98, 0xDB} // tag
+    //     };
+    //     // 解密
+    //     std::cout << "Decrypting..." << std::endl;
+    //     auto decStart = std::chrono::system_clock::now();
+    //     if (!crypto.decrypt(token2)) {
+    //         std::cerr << "Decryption failed" << std::endl;
+    //         return -1;
+    //     }
+    //     auto decElapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now() - decStart).count();
+    //     std::cout << "Decrypt elapsed time: " << decElapsed << " ns" << std::endl;
+    //     printToken(token2, "Decrypted");
+
+    //     if (originalTokenIdx == token.token_idx) {
+    //         std::cout << "SUCCESS: AES-GCM test passed!" << std::endl;
+    //     } else {
+    //         std::cerr << "FAILED: Decrypted token_idx mismatch" << std::endl;
+    //         return -1;
+    //     }
+
+    //     if (i == testMaxCnt - 1) {
+    //         auto totalElapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now() - totalStart).count();
+    //         long long cryptOnly = totalElapsed - totalMakeDataTime;
+    //         std::cout << "Encrypt+Decrypt elapsed time: " << cryptOnly
+    //                     << " ns (" << cryptOnly / 1000000 << " ms) for "
+    //                     << testMaxCnt << " iterations" << std::endl;
+    //     }
+
+    //     if (!testDecryptFail) continue;
+
+    //     // 测试篡改场景
+    //     std::cout << "Testing authentication failure..." << std::endl;
+    //     uint8_t x;
+    //     uint32_t y, z;
+    //     std::uniform_int_distribution<int> distU8(0, 255);
+    //     x = static_cast<uint8_t>(distU8(gen));
+    //     y = distU32(gen);
+    //     z = distU32(gen);
+    //     std::cout << "rand bytes: x=0x" << std::hex << (int)x << ", y=0x" << y << ", z=0x" << z << std::dec << std::endl;
+
+    //     // 篡改 tag
+    //     token.tag[0] ^= x;
+    //     if (!crypto.decrypt(token)) {
+    //         std::cout << "SUCCESS: Authentication failure detected (tag mismatch)" << std::endl;
+    //     } else {
+    //         std::cerr << "FAILED: Authentication should have failed" << std::endl;
+    //         return -1;
+    //     }
+    //     token.tag[0] ^= x; // 还原
+
+    //     // 篡改密文
+    //     token.token_idx ^= y;
+    //     if (!crypto.decrypt(token)) {
+    //         std::cout << "SUCCESS: Authentication failure detected (ciphertext tampered)" << std::endl;
+    //     } else {
+    //         std::cerr << "FAILED: Authentication should have failed" << std::endl;
+    //         return -1;
+    //     }
+
+    //     // 篡改 nonce（需要重新构造原始数据，因为上面已破坏）
+    //     token.nonce ^= z;
+    //     if (!crypto.decrypt(token)) {
+    //         std::cout << "SUCCESS: Authentication failure detected (nonce tampered)" << std::endl;
+    //     } else {
+    //         std::cerr << "FAILED: Authentication should have failed" << std::endl;
+    //         return -1;
+    //     }
+    // }
+
+    // std::cout << "\n=== AES-GCM Test PASSED ===" << std::endl;
 
 //加解密结束============================================
 
@@ -1495,6 +1881,7 @@ std::cout << "  handshake filter: " << (configManager.getHandshakeFilter() ? "on
 
         ndis_api->stop_all_filters();
         logFile.close();
+        AsyncJsonLogger::stop();
         std::cout << "Exiting..." << std::endl;
     }
     catch (const std::exception& ex) {
